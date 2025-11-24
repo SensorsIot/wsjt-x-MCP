@@ -4,6 +4,7 @@ import { WsjtxUdpListener } from './UdpListener';
 import { WsjtxDecode, WsjtxStatus } from './types';
 import { ProcessManager, WsjtxInstanceConfig } from './ProcessManager';
 import { QsoStateMachine, QsoConfig } from './QsoStateMachine';
+import { SliceMasterLogic } from './SliceMasterLogic';
 
 export class WsjtxManager extends EventEmitter {
     private config: Config;
@@ -11,6 +12,7 @@ export class WsjtxManager extends EventEmitter {
     private udpListener: WsjtxUdpListener;
     private processManager: ProcessManager;
     private activeQsos: Map<string, QsoStateMachine> = new Map();
+    private sliceMaster?: SliceMasterLogic;
 
     constructor(config: Config) {
         super();
@@ -46,62 +48,111 @@ export class WsjtxManager extends EventEmitter {
             console.log(`Process manager: Instance ${instance.name} started`);
         });
 
-        throw error;
+        this.processManager.on('instance-stopped', (instance) => {
+            console.log(`Process manager: Instance ${instance.name} stopped`);
+        });
     }
-}
+
+    public async start(): Promise<void> {
+        if (this.config.mode === 'STANDARD') {
+            console.log('Starting WSJT-X Manager in STANDARD mode.');
+            // Auto-start a default instance for Standard mode
+            this.startInstance({
+                name: this.config.standard.rigName || 'IC-7300',
+                rigName: this.config.standard.rigName,
+            });
+        } else {
+            console.log('Starting WSJT-X Manager in FLEX mode.');
+            // Slice Master will be initialized when FlexClient is connected
+        }
+
+        this.udpListener.start();
+    }
+
+    public setFlexClient(flexClient: any): void {
+        // Initialize Slice Master logic for FlexRadio mode
+        this.sliceMaster = new SliceMasterLogic(this.processManager);
+
+        flexClient.on('slice-added', (slice: any) => {
+            if (this.sliceMaster) {
+                this.sliceMaster.handleSliceAdded(slice);
+            }
+        });
+
+        flexClient.on('slice-removed', (slice: any) => {
+            if (this.sliceMaster) {
+                this.sliceMaster.handleSliceRemoved(slice);
+            }
+        });
+
+        flexClient.on('slice-updated', (slice: any) => {
+            if (this.sliceMaster) {
+                this.sliceMaster.handleSliceUpdated(slice);
+            }
+        });
+    }
+
+    public startInstance(config: WsjtxInstanceConfig): void {
+        try {
+            this.processManager.startInstance(config);
+        } catch (error) {
+            console.error('Failed to start instance:', error);
+            throw error;
+        }
+    }
 
     public stopInstance(name: string): boolean {
-    return this.processManager.stopInstance(name);
-}
+        return this.processManager.stopInstance(name);
+    }
 
     public executeQso(instanceId: string, targetCallsign: string, myCallsign: string, myGrid: string): void {
-    if(this.activeQsos.has(instanceId)) {
-    throw new Error(`QSO already in progress for instance ${instanceId}`);
-}
+        if (this.activeQsos.has(instanceId)) {
+            throw new Error(`QSO already in progress for instance ${instanceId}`);
+        }
 
-const qsoConfig: QsoConfig = {
-    instanceId,
-    targetCallsign,
-    myCallsign,
-    myGrid,
-};
+        const qsoConfig: QsoConfig = {
+            instanceId,
+            targetCallsign,
+            myCallsign,
+            myGrid,
+        };
 
-const qso = new QsoStateMachine(qsoConfig);
+        const qso = new QsoStateMachine(qsoConfig);
 
-qso.on('complete', (result) => {
-    console.log(`QSO completed: ${JSON.stringify(result)}`);
-    this.activeQsos.delete(instanceId);
-    this.emit('qso-complete', { instanceId, ...result });
-});
+        qso.on('complete', (result) => {
+            console.log(`QSO completed: ${JSON.stringify(result)}`);
+            this.activeQsos.delete(instanceId);
+            this.emit('qso-complete', { instanceId, ...result });
+        });
 
-qso.on('failed', (result) => {
-    console.log(`QSO failed: ${JSON.stringify(result)}`);
-    this.activeQsos.delete(instanceId);
-    this.emit('qso-failed', { instanceId, ...result });
-});
+        qso.on('failed', (result) => {
+            console.log(`QSO failed: ${JSON.stringify(result)}`);
+            this.activeQsos.delete(instanceId);
+            this.emit('qso-failed', { instanceId, ...result });
+        });
 
-this.activeQsos.set(instanceId, qso);
-qso.start();
+        this.activeQsos.set(instanceId, qso);
+        qso.start();
     }
 
     public getInstances(): any[] {
-    return this.processManager.getAllInstances().map(instance => ({
-        name: instance.name,
-        udpPort: instance.udpPort,
-        running: instance.isRunning(),
-    }));
-}
+        return this.processManager.getAllInstances().map(instance => ({
+            name: instance.name,
+            udpPort: instance.udpPort,
+            running: instance.isRunning(),
+        }));
+    }
 
-    public async stop(): Promise < void> {
-    console.log('Stopping WSJT-X Manager...');
+    public async stop(): Promise<void> {
+        console.log('Stopping WSJT-X Manager...');
 
-    // Abort all active QSOs
-    for(const qso of this.activeQsos.values()) {
-    qso.abort();
-}
-this.activeQsos.clear();
+        // Abort all active QSOs
+        for (const qso of this.activeQsos.values()) {
+            qso.abort();
+        }
+        this.activeQsos.clear();
 
-this.processManager.stopAll();
-this.udpListener.stop();
+        this.processManager.stopAll();
+        this.udpListener.stop();
     }
 }
