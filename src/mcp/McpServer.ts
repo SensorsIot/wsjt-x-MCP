@@ -26,6 +26,7 @@ export class WsjtxMcpServer {
         // Tool: start_instance
         this.server.tool(
             "start_instance",
+            "Start a new WSJT-X instance",
             {
                 name: z.string().describe("Friendly name for the instance"),
                 band: z.string().optional().describe("Target band (e.g., '20m')"),
@@ -34,7 +35,7 @@ export class WsjtxMcpServer {
             async ({ name, band, rigName }) => {
                 if (this.config.mode !== 'STANDARD') {
                     return {
-                        content: [{ type: "text", text: "Error: Manual start_instance is only available in STANDARD mode." }],
+                        content: [{ type: "text" as const, text: "Error: Manual start_instance is only available in STANDARD mode." }],
                         isError: true,
                     };
                 }
@@ -42,11 +43,11 @@ export class WsjtxMcpServer {
                 try {
                     this.wsjtxManager.startInstance({ name, band, rigName });
                     return {
-                        content: [{ type: "text", text: `Started WSJT-X instance: ${name}` }],
+                        content: [{ type: "text" as const, text: `Started WSJT-X instance: ${name}` }],
                     };
                 } catch (error) {
                     return {
-                        content: [{ type: "text", text: `Error: ${error}` }],
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
                         isError: true,
                     };
                 }
@@ -56,6 +57,7 @@ export class WsjtxMcpServer {
         // Tool: stop_instance
         this.server.tool(
             "stop_instance",
+            "Stop a running WSJT-X instance",
             {
                 name: z.string().describe("Friendly name of the instance"),
             },
@@ -63,11 +65,11 @@ export class WsjtxMcpServer {
                 const success = this.wsjtxManager.stopInstance(name);
                 if (success) {
                     return {
-                        content: [{ type: "text", text: `Stopped instance ${name}` }],
+                        content: [{ type: "text" as const, text: `Stopped instance ${name}` }],
                     };
                 } else {
                     return {
-                        content: [{ type: "text", text: `Instance ${name} not found` }],
+                        content: [{ type: "text" as const, text: `Instance ${name} not found` }],
                         isError: true,
                     };
                 }
@@ -77,6 +79,7 @@ export class WsjtxMcpServer {
         // Tool: execute_qso
         this.server.tool(
             "execute_qso",
+            "Execute an autonomous QSO with a target station",
             {
                 instanceId: z.string().describe("Instance ID (rig name)"),
                 targetCallsign: z.string().describe("Target station callsign"),
@@ -87,11 +90,11 @@ export class WsjtxMcpServer {
                 try {
                     this.wsjtxManager.executeQso(instanceId, targetCallsign, myCallsign, myGrid);
                     return {
-                        content: [{ type: "text", text: `Started autonomous QSO with ${targetCallsign}` }],
+                        content: [{ type: "text" as const, text: `Started autonomous QSO with ${targetCallsign}` }],
                     };
                 } catch (error) {
                     return {
-                        content: [{ type: "text", text: `Error: ${error}` }],
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
                         isError: true,
                     };
                 }

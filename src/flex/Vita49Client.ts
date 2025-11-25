@@ -16,6 +16,7 @@ export class Vita49Client extends EventEmitter {
     private port: number;
     private connected: boolean = false;
     private slices: Map<string, FlexSlice> = new Map();
+    private commandSeq: number = 1;
 
     constructor(host: string = '255.255.255.255', port: number = 4992) {
         super();
@@ -30,7 +31,10 @@ export class Vita49Client extends EventEmitter {
             this.socket.on('connect', () => {
                 console.log(`Connected to FlexRadio at ${this.host}:${this.port}`);
                 this.connected = true;
+                // Subscribe to slice status updates
                 this.sendCommand('sub slice all');
+                // Request current slice list
+                this.sendCommand('slice list');
                 this.emit('connected');
                 resolve();
             });
@@ -62,7 +66,7 @@ export class Vita49Client extends EventEmitter {
             if (!line.trim()) continue;
 
             // Parse FlexRadio responses
-            // Format: S<handle>|<message>
+            // Format: S<handle>|<message> or status messages
             if (line.startsWith('S')) {
                 const parts = line.substring(1).split('|');
                 if (parts.length >= 2) {
@@ -94,6 +98,7 @@ export class Vita49Client extends EventEmitter {
         const sliceId = `slice_${sliceIndex}`;
 
         let slice = this.slices.get(sliceId);
+        const isNew = !slice;
         if (!slice) {
             slice = {
                 id: sliceId,
@@ -104,7 +109,10 @@ export class Vita49Client extends EventEmitter {
             this.slices.set(sliceId, slice);
         }
 
-        // Parse key=value pairs
+        const wasActive = slice.active;
+        let inUseChanged = false;
+
+        // First pass: parse ALL key=value pairs to get complete slice state
         for (let i = 2; i < parts.length; i++) {
             const [key, value] = parts[i].split('=');
 
@@ -115,17 +123,12 @@ export class Vita49Client extends EventEmitter {
                 case 'mode':
                     slice.mode = value;
                     break;
-                case 'active':
-                    const wasActive = slice.active;
+                case 'in_use':
+                    // in_use indicates slice exists/allocated - this is what we care about
+                    // Note: 'active' field means currently selected/focused slice, which we ignore
                     slice.active = value === '1';
-
-                    // Emit events for slice state changes
-                    if (!wasActive && slice.active) {
-                        console.log(`Slice ${sliceId} activated: ${slice.frequency} Hz, ${slice.mode}`);
-                        this.emit('slice-added', slice);
-                    } else if (wasActive && !slice.active) {
-                        console.log(`Slice ${sliceId} deactivated`);
-                        this.emit('slice-removed', slice);
+                    if (slice.active !== wasActive) {
+                        inUseChanged = true;
                     }
                     break;
                 case 'dax':
@@ -134,6 +137,17 @@ export class Vita49Client extends EventEmitter {
                 case 'rxant':
                     slice.rxAnt = value;
                     break;
+            }
+        }
+
+        // Second pass: emit events AFTER all fields are parsed
+        if (inUseChanged) {
+            if (!wasActive && slice.active) {
+                console.log(`Slice ${sliceId} activated: ${slice.frequency} Hz, ${slice.mode}`);
+                this.emit('slice-added', slice);
+            } else if (wasActive && !slice.active) {
+                console.log(`Slice ${sliceId} deactivated`);
+                this.emit('slice-removed', slice);
             }
         }
 
@@ -147,11 +161,47 @@ export class Vita49Client extends EventEmitter {
             return;
         }
 
-        this.socket.write(`C${command}\n`);
+        // FlexRadio API format: C<seq_num>|<command>
+        const seq = this.commandSeq++;
+        const fullCommand = `C${seq}|${command}\n`;
+        console.log(`Sending command: ${fullCommand.trim()}`);
+        this.socket.write(fullCommand);
     }
 
     public getSlices(): FlexSlice[] {
         return Array.from(this.slices.values()).filter(s => s.active);
+    }
+
+    /**
+     * Tune a slice to a specific frequency
+     * @param sliceIndex Slice index (0, 1, 2, ...)
+     * @param frequencyHz Frequency in Hz
+     */
+    public tuneSlice(sliceIndex: number, frequencyHz: number): void {
+        // FlexRadio API: slice tune <index> <freq_in_mhz>
+        const freqMhz = (frequencyHz / 1e6).toFixed(6);
+        this.sendCommand(`slice tune ${sliceIndex} ${freqMhz}`);
+    }
+
+    /**
+     * Set the mode for a slice
+     * @param sliceIndex Slice index (0, 1, 2, ...)
+     * @param mode Mode string (USB, LSB, DIGU, DIGL, CW, AM, FM, etc.)
+     */
+    public setSliceMode(sliceIndex: number, mode: string): void {
+        // FlexRadio API: slice set <index> mode=<mode>
+        this.sendCommand(`slice set ${sliceIndex} mode=${mode}`);
+    }
+
+    /**
+     * Set PTT (transmit) state for a slice
+     * @param sliceIndex Slice index (0, 1, 2, ...)
+     * @param tx True for transmit, false for receive
+     */
+    public setSliceTx(sliceIndex: number, tx: boolean): void {
+        // FlexRadio API: xmit <0|1>
+        // Note: FlexRadio has a single transmitter, so this affects the active TX slice
+        this.sendCommand(`xmit ${tx ? '1' : '0'}`);
     }
 
     public disconnect(): void {

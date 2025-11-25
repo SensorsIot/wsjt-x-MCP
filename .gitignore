@@ -11,6 +11,12 @@ id_rsa.pub
 secrets.json
 credentials.json
 
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
 # AI and Tooling Artifacts
 .gemini/
 .antigravity/
@@ -23,3 +29,4 @@ credentials.json
 *.log
 tmp/
 temp/
+nul

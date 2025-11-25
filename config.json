@@ -1,0 +1,24 @@
+{
+  "mode": "FLEX",
+  "wsjtx": {
+    "path": "C:\\WSJT\\wsjtx\\bin\\wsjtx.exe"
+  },
+  "flex": {
+    "host": "10.99.6.135",
+    "catBasePort": 60000
+  },
+  "standard": {
+    "rigName": "IC-7300"
+  },
+  "station": {
+    "callsign": "HB9BLA",
+    "grid": "JN37VL"
+  },
+  "mcp": {
+    "name": "wsjt-x-mcp",
+    "version": "1.0.0"
+  },
+  "web": {
+    "port": 3000
+  }
+}

@@ -8,6 +8,22 @@ export interface WsjtxInstanceConfig {
     rigName?: string;
     udpPort?: number;
     wsjtxPath?: string;
+    // FlexRadio-specific settings
+    sliceIndex?: number;        // Slice index (A=0, B=1, etc.)
+    daxChannel?: number;        // DAX audio channel (1-8)
+    smartCatPort?: number;      // SmartCAT TCP port for CAT control
+    smartCatHost?: string;      // SmartCAT host (usually localhost)
+}
+
+// Default path - can be overridden via config
+let defaultWsjtxPath = 'C:\\WSJT\\wsjtx\\bin\\wsjtx.exe';
+
+export function setDefaultWsjtxPath(path: string) {
+    defaultWsjtxPath = path;
+}
+
+export function getDefaultWsjtxPath(): string {
+    return defaultWsjtxPath;
 }
 
 export class WsjtxProcess extends EventEmitter {
@@ -24,20 +40,31 @@ export class WsjtxProcess extends EventEmitter {
     }
 
     public start(): void {
-        // Default WSJT-X path (Windows)
-        const wsjtxPath = this.config.wsjtxPath || 'C:\\WSJT\\wsjtx\\bin\\wsjtx.exe';
+        // Use configured path or default
+        const wsjtxPath = this.config.wsjtxPath || defaultWsjtxPath;
 
         const args: string[] = [];
 
-        // Use --rig-name to identify this instance
+        // Use --rig-name to identify this instance and load its saved configuration
         if (this.config.rigName) {
             args.push('--rig-name', this.config.rigName);
         } else {
             args.push('--rig-name', this.name);
         }
 
-        console.log(`Starting WSJT-X instance: ${this.name}`);
-        console.log(`Command: ${wsjtxPath} ${args.join(' ')}`);
+        console.log(`\nStarting WSJT-X instance: ${this.name}`);
+        console.log(`  Command: ${wsjtxPath} ${args.join(' ')}`);
+
+        // Log FlexRadio-specific configuration (auto-configured via INI)
+        if (this.config.smartCatPort !== undefined) {
+            console.log(`  === FlexRadio Configuration (SliceMaster format) ===`);
+            console.log(`  DAX Channel: ${this.config.daxChannel || 'Not specified'}`);
+            console.log(`  SmartCAT: ${this.config.smartCatHost || '127.0.0.1'}:${this.config.smartCatPort}`);
+            console.log(`  Rig Type: Ham Radio Deluxe`);
+            console.log(`  Audio In: DAX Audio RX ${this.config.daxChannel || 1} (FlexRadio Systems DAX Audio)`);
+            console.log(`  Audio Out: DAX Audio TX (FlexRadio Systems DAX TX)`);
+            console.log(`  =====================================================`);
+        }
 
         this.process = spawn(wsjtxPath, args, {
             detached: false,

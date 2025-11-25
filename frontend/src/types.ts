@@ -1,58 +1,3 @@
-// WSJT-X UDP Message Types (QQT encoding)
-export enum WsjtxMessageType {
-    HEARTBEAT = 0,
-    STATUS = 1,
-    DECODE = 2,
-    CLEAR = 3,
-    REPLY = 4,
-    QSO_LOGGED = 5,
-    CLOSE = 6,
-    REPLAY = 7,
-    HALT_TX = 8,
-    FREE_TEXT = 9,
-    WSPR_DECODE = 10,
-    LOCATION = 11,
-    LOGGED_ADIF = 12,
-    HIGHLIGHT_CALLSIGN = 13,
-}
-
-export interface WsjtxDecode {
-    id: string;
-    newDecode: boolean;
-    time: number;
-    snr: number;
-    deltaTime: number;
-    deltaFrequency: number;
-    mode: string;
-    message: string;
-    lowConfidence: boolean;
-    offAir: boolean;
-}
-
-export interface WsjtxStatus {
-    id: string;
-    dialFrequency: number;
-    mode: string;
-    dxCall: string;
-    report: string;
-    txMode: string;
-    txEnabled: boolean;
-    transmitting: boolean;
-    decoding: boolean;
-    rxDF: number;
-    txDF: number;
-    deCall: string;
-    deGrid: string;
-    dxGrid: string;
-    txWatchdog: boolean;
-    subMode: string;
-    fastMode: boolean;
-    specialOpMode: number;
-    frequencyTolerance: number;
-    trPeriod: number;
-    configurationName: string;
-}
-
 // Station status for dashboard coloring (hierarchical priority)
 export type StationStatus = 'worked' | 'normal' | 'weak' | 'strong' | 'priority' | 'new_dxcc';
 
@@ -82,12 +27,31 @@ export interface SliceState {
     txEnabled: boolean;
 }
 
-// WebSocket message types for frontend
+// Dashboard configuration from server
+export interface DashboardConfig {
+    stationLifetimeSeconds: number;
+    colors: Record<StationStatus, string>;
+}
+
+// WebSocket message types
 export interface StationsUpdateMessage {
     type: 'STATIONS_UPDATE';
     slices: SliceState[];
-    config: {
-        stationLifetimeSeconds: number;
-        colors: Record<StationStatus, string>;
-    };
+    config: DashboardConfig;
 }
+
+export interface WelcomeMessage {
+    type: 'WELCOME';
+    message: string;
+}
+
+export interface InstancesUpdateMessage {
+    type: 'INSTANCES_UPDATE';
+    instances: Array<{
+        name: string;
+        status: string;
+        freq: string;
+    }>;
+}
+
+export type WebSocketMessage = StationsUpdateMessage | WelcomeMessage | InstancesUpdateMessage;

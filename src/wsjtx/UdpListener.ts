@@ -88,11 +88,20 @@ export class WsjtxUdpListener extends EventEmitter {
         const length = buffer.readUInt32BE(offset);
         offset += 4;
 
-        if (length === 0xffffffff) {
+        if (length === 0xffffffff || length === 0) {
             return { value: '', newOffset: offset };
         }
 
-        const value = buffer.toString('utf16le', offset, offset + length);
+        // Qt QString uses UTF-16BE (big-endian)
+        // We need to swap bytes for Node.js which expects UTF-16LE
+        const strBuffer = Buffer.alloc(length);
+        for (let i = 0; i < length; i += 2) {
+            if (i + 1 < length) {
+                strBuffer[i] = buffer[offset + i + 1];
+                strBuffer[i + 1] = buffer[offset + i];
+            }
+        }
+        const value = strBuffer.toString('utf16le');
         return { value, newOffset: offset + length };
     }
 

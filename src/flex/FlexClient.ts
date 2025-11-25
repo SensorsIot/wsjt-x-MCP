@@ -9,7 +9,8 @@ export class FlexClient extends EventEmitter {
     constructor(config: Config['flex']) {
         super();
         this.config = config;
-        this.vita49Client = new Vita49Client(config.host, config.port);
+        // VITA 49 API always uses port 4992
+        this.vita49Client = new Vita49Client(config.host, 4992);
         this.setupListeners();
     }
 
@@ -40,7 +41,7 @@ export class FlexClient extends EventEmitter {
     }
 
     public async connect(): Promise<void> {
-        console.log(`Connecting to FlexRadio at ${this.config.host}:${this.config.port}...`);
+        console.log(`Connecting to FlexRadio at ${this.config.host}:4992...`);
         await this.vita49Client.connect();
     }
 
