@@ -20,21 +20,11 @@ async function main() {
         }
 
         const wsjtxManager = new WsjtxManager(config);
-        const mcpServer = new WsjtxMcpServer(wsjtxManager, config);
         const webServer = new WebServer(config, wsjtxManager);
-
-        // Start WSJT-X Manager
-        await wsjtxManager.start();
-
-        // Start MCP Server
-        await mcpServer.start();
-
-        // Start Web Dashboard
-        webServer.start();
 
         let flexClient: FlexClient | null = null;
 
-        // If in Flex Mode, auto-discover radio and connect
+        // If in Flex Mode, auto-discover radio and connect BEFORE starting MCP
         if (config.mode === 'FLEX') {
             // Auto-discover FlexRadio on the network
             console.log('Discovering FlexRadio on the network...');
@@ -66,6 +56,18 @@ async function main() {
                 console.warn('Could not connect to FlexRadio - will retry when available');
             }
         }
+
+        // Create MCP server with optional FlexClient (for rig control tools)
+        const mcpServer = new WsjtxMcpServer(wsjtxManager, config, flexClient || undefined);
+
+        // Start WSJT-X Manager
+        await wsjtxManager.start();
+
+        // Start MCP Server
+        await mcpServer.start();
+
+        // Start Web Dashboard
+        webServer.start();
 
         // Handle shutdown
         process.on('SIGINT', async () => {

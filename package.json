@@ -24,9 +24,13 @@
     "@types/node": "^24.10.1",
     "@types/ws": "^8.18.1",
     "express": "^5.1.0",
+    "serialport": "^13.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
     "ws": "^8.18.3",
     "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/serialport": "^8.0.5"
   }
 }

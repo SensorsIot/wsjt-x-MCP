@@ -133,14 +133,25 @@ export class WebServer {
         });
     }
 
+    private getDefaultDashboardConfig() {
+        return {
+            stationLifetimeSeconds: this.config.dashboard?.stationLifetimeSeconds ?? 120,
+            colors: this.config.dashboard?.colors ?? {
+                worked: '#6b7280',
+                normal: '#3b82f6',
+                weak: '#eab308',
+                strong: '#22c55e',
+                priority: '#f97316',
+                new_dxcc: '#ec4899',
+            },
+        };
+    }
+
     private sendStationsUpdate(ws: WebSocket): void {
         const message: StationsUpdateMessage = {
             type: 'STATIONS_UPDATE',
             slices: this.wsjtxManager.getSliceStates(),
-            config: {
-                stationLifetimeSeconds: this.config.dashboard.stationLifetimeSeconds,
-                colors: this.config.dashboard.colors,
-            },
+            config: this.getDefaultDashboardConfig(),
         };
         ws.send(JSON.stringify(message));
     }
@@ -149,10 +160,7 @@ export class WebServer {
         const message: StationsUpdateMessage = {
             type: 'STATIONS_UPDATE',
             slices,
-            config: {
-                stationLifetimeSeconds: this.config.dashboard.stationLifetimeSeconds,
-                colors: this.config.dashboard.colors,
-            },
+            config: this.getDefaultDashboardConfig(),
         };
         const json = JSON.stringify(message);
 

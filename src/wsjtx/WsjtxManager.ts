@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { Config } from '../config';
 import { WsjtxUdpListener } from './UdpListener';
+import { UdpSender } from './UdpSender';
 import { WsjtxDecode, WsjtxStatus, SliceState } from './types';
 import { ProcessManager, WsjtxInstanceConfig } from './ProcessManager';
 import { QsoStateMachine, QsoConfig } from './QsoStateMachine';
@@ -11,6 +12,7 @@ export class WsjtxManager extends EventEmitter {
     private config: Config;
     private instances: Map<string, any> = new Map();
     private udpListener: WsjtxUdpListener;
+    private udpSender: UdpSender;
     private processManager: ProcessManager;
     private activeQsos: Map<string, QsoStateMachine> = new Map();
     private sliceMaster?: SliceMasterLogic;
@@ -20,6 +22,7 @@ export class WsjtxManager extends EventEmitter {
         super();
         this.config = config;
         this.udpListener = new WsjtxUdpListener(2237);
+        this.udpSender = new UdpSender(2237);
         this.processManager = new ProcessManager();
         this.stationTracker = new StationTracker(config);
         this.setupListeners();
@@ -86,10 +89,37 @@ export class WsjtxManager extends EventEmitter {
 
     public setFlexClient(flexClient: any): void {
         // Initialize Slice Master logic for FlexRadio mode
-        this.sliceMaster = new SliceMasterLogic(this.processManager);
+        // Pass station config (callsign, grid) for WSJT-X INI configuration
+        this.sliceMaster = new SliceMasterLogic(
+            this.processManager,
+            undefined, // use default HRD CAT base port
+            {
+                callsign: this.config.station.callsign,
+                grid: this.config.station.grid,
+            }
+        );
 
         // Handle slice events from FlexRadio
         flexClient.on('slice-added', (slice: any) => {
+            // Auto-tune slice to default band frequency if configured
+            const defaultBands = this.config.flex.defaultBands;
+            if (defaultBands && slice.id) {
+                // Extract slice index from ID (e.g., "slice_0" -> 0)
+                const match = slice.id.match(/slice_(\d+)/);
+                if (match) {
+                    const sliceIndex = parseInt(match[1]);
+                    if (sliceIndex < defaultBands.length) {
+                        const targetFreq = defaultBands[sliceIndex];
+                        const freqMHz = (targetFreq / 1e6).toFixed(3);
+                        console.log(`Auto-tuning slice ${sliceIndex} to ${freqMHz} MHz (default band)`);
+
+                        // Tune to FT8 frequency and set DIGU mode
+                        flexClient.tuneSlice(sliceIndex, targetFreq);
+                        flexClient.setSliceMode(sliceIndex, 'DIGU');
+                    }
+                }
+            }
+
             if (this.sliceMaster) {
                 this.sliceMaster.handleSliceAdded(slice);
             }
@@ -121,6 +151,21 @@ export class WsjtxManager extends EventEmitter {
         this.sliceMaster.on('cat-ptt-change', (sliceIndex: number, tx: boolean) => {
             console.log(`Forwarding PTT to FlexRadio: slice ${sliceIndex} -> ${tx ? 'TX' : 'RX'}`);
             flexClient.setSliceTx(sliceIndex, tx);
+        });
+
+        // Handle instance launch - HRD CAT server provides initial frequency
+        // No need to send UDP frequency command since WSJT-X gets it from HRD CAT
+        this.sliceMaster.on('instance-launched', (data: {
+            sliceId: string;
+            instanceName: string;
+            sliceLetter: string;
+            daxChannel: number;
+            catPort: number;
+            frequency: number;
+            udpPort: number;
+        }) => {
+            console.log(`Instance ${data.instanceName} launched for slice ${data.sliceId}`);
+            console.log(`  HRD CAT server on port ${data.catPort} will provide frequency ${(data.frequency / 1e6).toFixed(3)} MHz`);
         });
     }
 
@@ -187,6 +232,108 @@ export class WsjtxManager extends EventEmitter {
         this.stationTracker.reloadAdifLog();
     }
 
+    // === WSJT-X UDP Control Methods ===
+
+    /**
+     * Configure WSJT-X instance mode and settings
+     * Note: This cannot change dial frequency - only CAT/SmartSDR can do that
+     */
+    public configureInstance(
+        instanceId: string,
+        options: {
+            mode?: string;           // e.g., "FT8", "FT4"
+            frequencyTolerance?: number;
+            submode?: string;
+            fastMode?: boolean;
+            trPeriod?: number;       // T/R period in seconds
+            rxDF?: number;           // RX audio frequency offset
+            dxCall?: string;
+            dxGrid?: string;
+            generateMessages?: boolean;
+        }
+    ): void {
+        this.udpSender.sendConfigure(instanceId, options);
+    }
+
+    /**
+     * Switch WSJT-X to a named configuration profile
+     * This can effectively change bands if the profile has different frequency settings
+     */
+    public switchConfiguration(instanceId: string, configurationName: string): void {
+        this.udpSender.sendSwitchConfiguration(instanceId, configurationName);
+    }
+
+    /**
+     * Clear decode windows in WSJT-X
+     * window: 0 = Band Activity, 1 = Rx Frequency, 2 = Both
+     */
+    public clearDecodes(instanceId: string, window: 0 | 1 | 2 = 2): void {
+        this.udpSender.sendClear(instanceId, window);
+    }
+
+    /**
+     * Set the station's Maidenhead grid location
+     */
+    public setLocation(instanceId: string, grid: string): void {
+        this.udpSender.sendLocation(instanceId, grid);
+    }
+
+    /**
+     * Highlight a callsign in the WSJT-X band activity window
+     */
+    public highlightCallsign(
+        instanceId: string,
+        callsign: string,
+        backgroundColor: { r: number; g: number; b: number; a?: number },
+        foregroundColor: { r: number; g: number; b: number; a?: number },
+        highlightLast: boolean = true
+    ): void {
+        this.udpSender.sendHighlightCallsign(instanceId, callsign, backgroundColor, foregroundColor, highlightLast);
+    }
+
+    /**
+     * Halt TX in WSJT-X
+     */
+    public haltTx(instanceId: string, autoTxOnly: boolean = true): void {
+        this.udpSender.sendHaltTx(instanceId, autoTxOnly);
+    }
+
+    /**
+     * Set free text message in WSJT-X
+     */
+    public setFreeText(instanceId: string, text: string, send: boolean = false): void {
+        this.udpSender.sendFreeText(instanceId, text, send);
+    }
+
+    /**
+     * Reply to a station (simulate double-click on decode)
+     */
+    public replyToStation(
+        instanceId: string,
+        time: number,
+        snr: number,
+        deltaTime: number,
+        deltaFrequency: number,
+        mode: string,
+        message: string
+    ): void {
+        this.udpSender.sendReply(instanceId, time, snr, deltaTime, deltaFrequency, mode, message);
+    }
+
+    /**
+     * Set dial frequency in WSJT-X (Rig Control Command)
+     * This will tune WSJT-X to the specified frequency, which will then
+     * command the radio via CAT. Band changes automatically if frequency
+     * is on a different band.
+     *
+     * @param instanceId - Instance ID (rig name)
+     * @param frequencyHz - Dial frequency in Hz (e.g., 14074000 for 20m FT8)
+     * @param mode - Optional mode to set (e.g., "USB", "DIGU")
+     */
+    public setFrequency(instanceId: string, frequencyHz: number, mode?: string): void {
+        this.udpSender.sendSetFrequency(instanceId, frequencyHz, mode);
+    }
+
     public async stop(): Promise<void> {
         console.log('Stopping WSJT-X Manager...');
 
@@ -196,9 +343,9 @@ export class WsjtxManager extends EventEmitter {
         }
         this.activeQsos.clear();
 
-        // Stop CAT servers
+        // Stop HRD CAT servers
         if (this.sliceMaster) {
-            this.sliceMaster.stopAllCatServers();
+            this.sliceMaster.stopAll();
         }
 
         this.stationTracker.stop();

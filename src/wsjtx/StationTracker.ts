@@ -107,7 +107,7 @@ export class StationTracker extends EventEmitter {
     constructor(config: Config) {
         super();
         this.config = config;
-        this.adifReader = new AdifLogReader(config.dashboard.adifLogPath);
+        this.adifReader = new AdifLogReader(config.dashboard?.adifLogPath ?? '');
 
         // Start periodic cleanup of expired stations
         this.startCleanup();
@@ -122,7 +122,7 @@ export class StationTracker extends EventEmitter {
 
     private cleanupExpiredStations(): void {
         const now = Date.now();
-        const lifetimeMs = this.config.dashboard.stationLifetimeSeconds * 1000;
+        const lifetimeMs = (this.config.dashboard?.stationLifetimeSeconds ?? 120) * 1000;
         let changed = false;
 
         for (const slice of this.slices.values()) {
@@ -255,10 +255,10 @@ export class StationTracker extends EventEmitter {
         // }
 
         // 4. Signal strength
-        if (snr >= this.config.dashboard.snrStrongThreshold) {
+        if (snr >= (this.config.dashboard?.snrStrongThreshold ?? 0)) {
             return 'strong';
         }
-        if (snr <= this.config.dashboard.snrWeakThreshold) {
+        if (snr <= (this.config.dashboard?.snrWeakThreshold ?? -15)) {
             return 'weak';
         }
 
@@ -312,7 +312,7 @@ export class StationTracker extends EventEmitter {
 
     public updateConfig(config: Config): void {
         this.config = config;
-        this.adifReader.setPath(config.dashboard.adifLogPath);
+        this.adifReader.setPath(config.dashboard?.adifLogPath ?? '');
     }
 
     public stop(): void {

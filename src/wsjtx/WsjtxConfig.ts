@@ -25,8 +25,49 @@ export interface RigConfig {
     daxChannel?: number;        // DAX audio channel (1-8)
 }
 
+export interface Ts2000RigConfig {
+    comPort: string;            // Virtual COM port (e.g., COM31)
+    daxChannel?: number;        // DAX audio channel (1-8)
+    baudRate?: number;          // Baud rate (default 38400)
+}
+
+export interface NetworkCatConfig {
+    host: string;               // TCP host (usually 127.0.0.1)
+    port: number;               // TCP port (60001-60004)
+    daxChannel?: number;        // DAX audio channel (1-8)
+}
+
+export interface FlexSliceConfig {
+    sliceIndex: number;         // 0-3 for Slice A-D
+    catPort: number;            // CAT TCP port (60001-60004)
+    daxChannel?: number;        // DAX audio channel (1-8)
+    udpPort?: number;           // UDP server port (2237-2240)
+}
+
+export interface HrdCatConfig {
+    sliceIndex: number;         // 0-3 for Slice A-D
+    catPort: number;            // HRD CAT TCP port (7800-7803)
+    daxChannel?: number;        // DAX audio channel (1-8)
+    udpPort?: number;           // UDP server port (2237-2240)
+    callsign?: string;          // Station callsign (e.g., HB9BLA)
+    grid?: string;              // Station grid locator (e.g., JN37VL)
+}
+
+// HamlibRig IDs for FlexRadio SmartSDR Slices
+// These are the rig IDs WSJT-X uses for native Flex slice support
+export const FLEX_SLICE_HAMLIB_IDS: Record<number, number> = {
+    0: 1035,  // Slice A
+    1: 1036,  // Slice B
+    2: 1037,  // Slice C
+    3: 1038,  // Slice D
+};
+
 // SmartCAT base port used by SliceMaster (7831 for slice A, 7832 for B, etc.)
 export const SMARTCAT_BASE_PORT = 7831;
+
+// HRD CAT server base port (our implementation: 7809 for slice A, 7810 for B, etc.)
+// The default HRD port is 7809 according to WSJT-X HRDTransceiver.cpp
+export const HRD_CAT_BASE_PORT = 7809;
 
 export interface WsjtxInstanceSettings {
     rigName: string;
@@ -35,7 +76,7 @@ export interface WsjtxInstanceSettings {
 }
 
 /**
- * Get the WSJT-X config directory path
+ * Get the base WSJT-X config directory path (for default instance)
  */
 export function getWsjtxConfigDir(): string {
     // Windows: %LOCALAPPDATA%\WSJT-X
@@ -51,11 +92,36 @@ export function getWsjtxConfigDir(): string {
 }
 
 /**
+ * Get the instance-specific settings folder path
+ *
+ * IMPORTANT: WSJT-X --rig-name creates/uses a SEPARATE FOLDER per instance:
+ *   - Windows: %LOCALAPPDATA%\WSJT-X - <rigName>\
+ *   - The folder contains: WSJT-X - <rigName>.ini
+ *
+ * This matches SliceMaster's working configuration pattern.
+ */
+export function getInstanceConfigDir(rigName: string): string {
+    if (process.platform === 'win32') {
+        return path.join(os.homedir(), 'AppData', 'Local', `WSJT-X - ${rigName}`);
+    } else if (process.platform === 'darwin') {
+        return path.join(os.homedir(), 'Library', 'Preferences', `WSJT-X - ${rigName}`);
+    } else {
+        return path.join(os.homedir(), '.config', `WSJT-X - ${rigName}`);
+    }
+}
+
+/**
  * Get the INI file path for a specific WSJT-X instance
+ *
+ * Pattern: %LOCALAPPDATA%\WSJT-X - <rigName>\WSJT-X - <rigName>.ini
+ *
+ * This is the SliceMaster-compatible folder structure:
+ *   - Folder: "WSJT-X - Slice-A"
+ *   - INI file: "WSJT-X - Slice-A.ini" (inside that folder)
  */
 export function getInstanceIniPath(rigName: string): string {
-    const configDir = getWsjtxConfigDir();
-    // Instance-specific config files are named "WSJT-X - <rigName>.ini"
+    const configDir = getInstanceConfigDir(rigName);
+    // INI file is inside the instance-specific folder with matching name
     return path.join(configDir, `WSJT-X - ${rigName}.ini`);
 }
 
@@ -148,13 +214,14 @@ export function configureWideGraph(
     config: WideGraphConfig
 ): boolean {
     const iniPath = getInstanceIniPath(rigName);
-    const configDir = getWsjtxConfigDir();
+    const configDir = getInstanceConfigDir(rigName);
 
     console.log(`Configuring Wide Graph for ${rigName}:`);
     console.log(`  INI path: ${iniPath}`);
 
-    // Ensure config directory exists
+    // Ensure instance-specific config directory exists
     if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
         fs.mkdirSync(configDir, { recursive: true });
     }
 
@@ -296,7 +363,7 @@ export function configureRigForSmartCat(
     config: RigConfig
 ): boolean {
     const iniPath = getInstanceIniPath(rigName);
-    const configDir = getWsjtxConfigDir();
+    const configDir = getInstanceConfigDir(rigName);
 
     const smartCatHost = config.smartCatHost || '127.0.0.1';
     const smartCatPort = config.smartCatPort || SMARTCAT_BASE_PORT;
@@ -307,8 +374,9 @@ export function configureRigForSmartCat(
     console.log(`  SmartCAT: ${smartCatHost}:${smartCatPort}`);
     console.log(`  DAX Channel: ${daxChannel}`);
 
-    // Ensure config directory exists
+    // Ensure instance-specific config directory exists
     if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
         fs.mkdirSync(configDir, { recursive: true });
     }
 
@@ -366,6 +434,388 @@ export function configureRigForSmartCat(
         return true;
     } catch (error) {
         console.error(`  Failed to write rig config:`, error);
+        return false;
+    }
+}
+
+/**
+ * Configure Rig/Radio settings for TS-2000 via virtual COM port
+ * This configures WSJT-X to use "Kenwood TS-2000" rig type over serial
+ */
+export function configureRigForTs2000(
+    rigName: string,
+    config: Ts2000RigConfig
+): boolean {
+    const iniPath = getInstanceIniPath(rigName);
+    const configDir = getInstanceConfigDir(rigName);
+
+    const comPort = config.comPort;
+    const daxChannel = config.daxChannel || 1;
+    const baudRate = config.baudRate || 38400;
+
+    console.log(`Configuring Rig for TS-2000 CAT (${rigName}):`);
+    console.log(`  INI path: ${iniPath}`);
+    console.log(`  COM Port: ${comPort}`);
+    console.log(`  Baud Rate: ${baudRate}`);
+    console.log(`  DAX Channel: ${daxChannel}`);
+
+    // Ensure instance-specific config directory exists
+    if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
+        fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    let sections: Map<string, Map<string, string>>;
+
+    // Read existing config or create new
+    if (fs.existsSync(iniPath)) {
+        const content = fs.readFileSync(iniPath, 'utf-8');
+        sections = parseIni(content);
+    } else {
+        sections = new Map();
+    }
+
+    // Ensure Configuration section exists
+    if (!sections.has('Configuration')) {
+        sections.set('Configuration', new Map());
+    }
+
+    const configSection = sections.get('Configuration')!;
+
+    // Use "Kenwood TS-2000" rig type
+    configSection.set('Rig', 'Kenwood TS-2000');
+
+    // Serial port settings
+    configSection.set('CATSerialPort', comPort);
+    configSection.set('CATSerialPortParameters', `${baudRate},8,N,1,H,false,false`);
+
+    // PTT method - CAT
+    configSection.set('PTTMethod', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::PTTMethod\\0\\0\\0\\0\\xfPTT_method_CAT\\0)');
+
+    // Split operation mode - None (or Rig for split)
+    configSection.set('SplitMode', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::SplitMode\\0\\0\\0\\0\\x10split_mode_none\\0)');
+
+    // Audio settings - DAX channel
+    const daxRx = `DAX Audio RX ${daxChannel} (FlexRadio Systems DAX Audio)`;
+    const daxTx = `DAX Audio TX (FlexRadio Systems DAX TX)`;
+    configSection.set('SoundInName', daxRx);
+    configSection.set('SoundOutName', daxTx);
+    configSection.set('AudioInputChannel', 'Mono');
+    configSection.set('AudioOutputChannel', 'Mono');
+
+    // Set reasonable defaults
+    configSection.set('RxBandwidth', '4500');
+    configSection.set('Polling', '1');
+
+    console.log(`  Rig: Kenwood TS-2000`);
+    console.log(`  Serial: ${comPort} @ ${baudRate}`);
+    console.log(`  Audio In: ${daxRx}`);
+    console.log(`  Audio Out: ${daxTx}`);
+
+    // Write back
+    try {
+        const content = serializeIni(sections);
+        fs.writeFileSync(iniPath, content, 'utf-8');
+        console.log(`  Rig configuration saved successfully`);
+        return true;
+    } catch (error) {
+        console.error(`  Failed to write rig config:`, error);
+        return false;
+    }
+}
+
+/**
+ * Configure Rig/Radio settings for TS-2000 via TCP Network Server
+ * Per Rig-control.md: WSJT-X connects to localhost:60001-60004
+ */
+export function configureRigForNetworkCat(
+    rigName: string,
+    config: NetworkCatConfig
+): boolean {
+    const iniPath = getInstanceIniPath(rigName);
+    const configDir = getInstanceConfigDir(rigName);
+
+    const host = config.host;
+    const port = config.port;
+    const daxChannel = config.daxChannel || 1;
+
+    console.log(`Configuring Rig for Network CAT (${rigName}):`);
+    console.log(`  INI path: ${iniPath}`);
+    console.log(`  Network Server: ${host}:${port}`);
+    console.log(`  DAX Channel: ${daxChannel}`);
+
+    // Ensure instance-specific config directory exists
+    if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
+        fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    let sections: Map<string, Map<string, string>>;
+
+    if (fs.existsSync(iniPath)) {
+        const content = fs.readFileSync(iniPath, 'utf-8');
+        sections = parseIni(content);
+    } else {
+        sections = new Map();
+    }
+
+    if (!sections.has('Configuration')) {
+        sections.set('Configuration', new Map());
+    }
+
+    const configSection = sections.get('Configuration')!;
+
+    // Rig type: Kenwood TS-2000
+    configSection.set('Rig', 'Kenwood TS-2000');
+
+    // Network Server mode (not serial port)
+    configSection.set('CATSerialPort', 'Network Server');
+    configSection.set('CATNetworkPort', `${host}:${port}`);
+
+    // PTT method - CAT
+    configSection.set('PTTMethod', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::PTTMethod\\0\\0\\0\\0\\xfPTT_method_CAT\\0)');
+
+    // Split operation mode - Rig (per Rig-control.md)
+    configSection.set('SplitMode', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::SplitMode\\0\\0\\0\\0\\x0esplit_mode_rig\\0)');
+
+    // Audio settings - DAX channel
+    const daxRx = `DAX Audio RX ${daxChannel} (FlexRadio Systems DAX Audio)`;
+    const daxTx = `DAX Audio TX (FlexRadio Systems DAX TX)`;
+    configSection.set('SoundInName', daxRx);
+    configSection.set('SoundOutName', daxTx);
+    configSection.set('AudioInputChannel', 'Mono');
+    configSection.set('AudioOutputChannel', 'Mono');
+
+    // Set reasonable defaults
+    configSection.set('RxBandwidth', '4500');
+    configSection.set('Polling', '1');
+
+    console.log(`  Rig: Kenwood TS-2000 (Network Server)`);
+    console.log(`  Network: ${host}:${port}`);
+    console.log(`  Audio In: ${daxRx}`);
+    console.log(`  Audio Out: ${daxTx}`);
+
+    try {
+        const content = serializeIni(sections);
+        fs.writeFileSync(iniPath, content, 'utf-8');
+        console.log(`  Rig configuration saved successfully`);
+        return true;
+    } catch (error) {
+        console.error(`  Failed to write rig config:`, error);
+        return false;
+    }
+}
+
+/**
+ * Configure Rig/Radio settings for native FlexRadio SmartSDR Slice mode
+ * Per updated Rig-control.md: Uses WSJT-X built-in "FlexRadio SmartSDR Slice A-F"
+ * No TS-2000 emulation - native Flex slice support
+ */
+export function configureRigForFlexSlice(
+    rigName: string,
+    config: FlexSliceConfig
+): boolean {
+    const iniPath = getInstanceIniPath(rigName);
+    const configDir = getInstanceConfigDir(rigName);
+
+    const sliceIndex = config.sliceIndex;
+    const catPort = config.catPort;
+    const daxChannel = config.daxChannel || (sliceIndex + 1);
+    const udpPort = config.udpPort || (2237 + sliceIndex);
+    const hamlibRigId = FLEX_SLICE_HAMLIB_IDS[sliceIndex] || 1035;
+
+    console.log(`Configuring Rig for FlexRadio Slice ${String.fromCharCode(65 + sliceIndex)} (${rigName}):`);
+    console.log(`  INI path: ${iniPath}`);
+    console.log(`  HamlibRig: ${hamlibRigId} (Flex Slice ${String.fromCharCode(65 + sliceIndex)})`);
+    console.log(`  CAT Port: localhost:${catPort}`);
+    console.log(`  DAX Channel: ${daxChannel}`);
+    console.log(`  UDP Port: ${udpPort}`);
+
+    // Ensure instance-specific config directory exists
+    if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
+        fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    let sections: Map<string, Map<string, string>>;
+
+    if (fs.existsSync(iniPath)) {
+        const content = fs.readFileSync(iniPath, 'utf-8');
+        sections = parseIni(content);
+    } else {
+        sections = new Map();
+    }
+
+    if (!sections.has('Configuration')) {
+        sections.set('Configuration', new Map());
+    }
+
+    const configSection = sections.get('Configuration')!;
+
+    // Native FlexRadio SmartSDR Slice settings per Rig-control.md
+    configSection.set('Rig', '1');
+    configSection.set('HamlibRig', hamlibRigId.toString());
+    configSection.set('CATPort', `localhost:${catPort}`);
+
+    // PTT method - CAT
+    configSection.set('PTTMethod', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::PTTMethod\\0\\0\\0\\0\\xfPTT_method_CAT\\0)');
+
+    // Mode - Data/Pkt
+    configSection.set('Mode', 'Data/Pkt');
+
+    // Split operation mode - Rig
+    configSection.set('SplitMode', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::SplitMode\\0\\0\\0\\0\\x0esplit_mode_rig\\0)');
+
+    // UDP server settings (unique per instance)
+    configSection.set('UDPServerPort', udpPort.toString());
+    configSection.set('UDPServer', '127.0.0.1');
+    configSection.set('AcceptUDPRequests', 'true');  // CRITICAL: Enable UDP control commands
+
+    // Audio settings - DAX channel
+    const daxRxFlex = `DAX Audio RX ${daxChannel} (FlexRadio Systems DAX Audio)`;
+    const daxTxFlex = `DAX Audio TX (FlexRadio Systems DAX TX)`;
+    configSection.set('SoundInName', daxRxFlex);
+    configSection.set('SoundOutName', daxTxFlex);
+    configSection.set('AudioInputChannel', 'Mono');
+    configSection.set('AudioOutputChannel', 'Mono');
+
+    // Set reasonable defaults
+    configSection.set('RxBandwidth', '4500');
+    configSection.set('Polling', '1');
+
+    console.log(`  Rig: FlexRadio SmartSDR Slice ${String.fromCharCode(65 + sliceIndex)}`);
+    console.log(`  Audio In: ${daxRxFlex}`);
+    console.log(`  Audio Out: ${daxTxFlex}`);
+
+    try {
+        const content = serializeIni(sections);
+        fs.writeFileSync(iniPath, content, 'utf-8');
+        console.log(`  Rig configuration saved successfully`);
+        return true;
+    } catch (error) {
+        console.error(`  Failed to write rig config:`, error);
+        return false;
+    }
+}
+
+/**
+ * Configure Rig/Radio settings for HRD CAT (Ham Radio Deluxe protocol)
+ * This is how SliceMaster works - WSJT-X uses "Ham Radio Deluxe" rig type
+ * and connects to our HRD CAT server which translates to FlexRadio API
+ *
+ * Key points from SliceMaster architecture:
+ * - WSJT-X connects as an "HRD client" to our TCP server
+ * - We translate HRD commands (set frequency, mode, PTT) to FlexRadio API
+ * - Bidirectional sync: WSJT-X tune -> slice moves, slice tune -> WSJT-X follows
+ * - No SmartSDR CAT needed - our HRD TCP shim replaces it
+ */
+export function configureRigForHrdCat(
+    rigName: string,
+    config: HrdCatConfig
+): boolean {
+    const iniPath = getInstanceIniPath(rigName);
+    const configDir = getInstanceConfigDir(rigName);
+
+    const sliceIndex = config.sliceIndex;
+    const catPort = config.catPort;
+    const daxChannel = config.daxChannel || (sliceIndex + 1);
+    const udpPort = config.udpPort || (2237 + sliceIndex);
+    const sliceLetter = String.fromCharCode(65 + sliceIndex);
+
+    console.log(`Configuring Rig for HRD CAT - Slice ${sliceLetter} (${rigName}):`);
+    console.log(`  INI path: ${iniPath}`);
+    console.log(`  Config folder: ${configDir}`);
+    console.log(`  HRD CAT Port: localhost:${catPort}`);
+    console.log(`  DAX Channel: ${daxChannel}`);
+    console.log(`  UDP Port: ${udpPort}`);
+
+    // Ensure instance-specific config directory exists (SliceMaster pattern)
+    if (!fs.existsSync(configDir)) {
+        console.log(`  Creating config folder: ${configDir}`);
+        fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    let sections: Map<string, Map<string, string>>;
+
+    if (fs.existsSync(iniPath)) {
+        const content = fs.readFileSync(iniPath, 'utf-8');
+        sections = parseIni(content);
+    } else {
+        // Use template if available
+        const templatePath = path.join(__dirname, '..', '..', 'templates', 'wsjtx-template.ini');
+        if (fs.existsSync(templatePath)) {
+            console.log(`  Using template from ${templatePath}`);
+            const content = fs.readFileSync(templatePath, 'utf-8');
+            sections = parseIni(content);
+        } else {
+            sections = new Map();
+        }
+    }
+
+    if (!sections.has('Configuration')) {
+        sections.set('Configuration', new Map());
+    }
+
+    const configSection = sections.get('Configuration')!;
+
+    // Ham Radio Deluxe rig type - this is what SliceMaster uses
+    configSection.set('Rig', 'Ham Radio Deluxe');
+
+    // Network Server with our HRD CAT port
+    configSection.set('CATNetworkPort', `127.0.0.1:${catPort}`);
+
+    // IMPORTANT: Remove any conflicting settings from previous configurations
+    // These would confuse WSJT-X if both HRD and native FlexRadio settings exist
+    configSection.delete('HamlibRig');
+    configSection.delete('CATPort');
+    configSection.delete('CATSerialPort');
+    configSection.delete('CATSerialPortParameters');
+
+    // PTT method - CAT
+    configSection.set('PTTMethod', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::PTTMethod\\0\\0\\0\\0\\xfPTT_method_CAT\\0)');
+
+    // Split operation mode - None (HRD handles this)
+    configSection.set('SplitMode', '@Variant(\\0\\0\\0\\x7f\\0\\0\\0\\x1eTransceiverFactory::SplitMode\\0\\0\\0\\0\\x10split_mode_none\\0)');
+
+    // UDP server settings (unique per instance)
+    configSection.set('UDPServerPort', udpPort.toString());
+    configSection.set('UDPServer', '127.0.0.1');
+    configSection.set('AcceptUDPRequests', 'true');
+
+    // Audio settings - DAX channel
+    const daxRx = `DAX Audio RX ${daxChannel} (FlexRadio Systems DAX Audio)`;
+    const daxTx = `DAX Audio TX (FlexRadio Systems DAX TX)`;
+    configSection.set('SoundInName', daxRx);
+    configSection.set('SoundOutName', daxTx);
+    configSection.set('AudioInputChannel', 'Mono');
+    configSection.set('AudioOutputChannel', 'Mono');
+
+    // Set reasonable defaults
+    configSection.set('RxBandwidth', '4500');
+    configSection.set('Polling', '1');
+
+    // Station info (callsign and grid locator)
+    if (config.callsign) {
+        configSection.set('MyCall', config.callsign);
+        console.log(`  Callsign: ${config.callsign}`);
+    }
+    if (config.grid) {
+        configSection.set('MyGrid', config.grid);
+        console.log(`  Grid: ${config.grid}`);
+    }
+
+    console.log(`  Rig: Ham Radio Deluxe`);
+    console.log(`  Network: 127.0.0.1:${catPort}`);
+    console.log(`  Audio In: ${daxRx}`);
+    console.log(`  Audio Out: ${daxTx}`);
+
+    try {
+        const content = serializeIni(sections);
+        fs.writeFileSync(iniPath, content, 'utf-8');
+        console.log(`  HRD CAT rig configuration saved successfully`);
+        return true;
+    } catch (error) {
+        console.error(`  Failed to write HRD CAT rig config:`, error);
         return false;
     }
 }

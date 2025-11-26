@@ -31,182 +31,26 @@ The system provides:
 ### 3.2. Operation Modes
 
 #### Mode A: FlexRadio (Advanced)
-- Connects to FlexRadio via VITA 49 protocol (TCP port 4992)
+- Connects to FlexRadio via VITA 49 protocol (UDP port 4992)
 - Monitors slice additions/removals/updates in real-time
 - Automatically launches WSJT-X instance for each digital slice
 - Automatically terminates WSJT-X when slice is removed
 - Syncs frequency/mode configuration between SmartSDR and WSJT-X
 - Managed by `SliceMasterLogic` component
-- Audio via DAX (Digital Audio eXchange) virtual devices
-- **Built-in CAT Server**: Integrated Kenwood TS-2000 compatible CAT server (no external SmartCAT required)
-  - Listens on TCP ports 7831, 7832, 7833, 7834 (one per slice A, B, C, D)
-  - WSJT-X configured for "Ham Radio Deluxe" rig type
-  - Translates CAT commands to FlexRadio API calls
-- Instance naming convention: "Slice-A", "Slice-B", "Slice-C", "Slice-D"
 
 #### Mode B: Standard (Basic)
 - Default configuration for IC-7300 (configurable for other rigs)
 - AI agent or user manually starts/stops WSJT-X instances via MCP tools
 - Single instance operation (can manage multiple if manually configured)
 - Fixed rig configuration per instance
-- WSJT-X configured directly for rig CAT control
 
-### 3.3. System Block Diagrams
-
-#### Standard Mode Architecture
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Windows PC                                   │
-│  ┌─────────────┐                              ┌─────────────────┐   │
-│  │  AI Agent   │◄──────MCP/stdio─────────────►│   MCP Server    │   │
-│  │  (Claude)   │                              │   (Node.js)     │   │
-│  └─────────────┘                              └────────┬────────┘   │
-│                                                        │            │
-│                                               ┌────────▼────────┐   │
-│                                               │  WsjtxManager   │   │
-│                                               └────────┬────────┘   │
-│                                                        │            │
-│        ┌───────────────────────────────────────────────┼──────┐     │
-│        │                                               │      │     │
-│        ▼                                               ▼      │     │
-│  ┌───────────┐    UDP 2237     ┌─────────────┐  ┌──────────┐ │     │
-│  │UdpListener│◄────────────────│   WSJT-X    │◄─│ Process  │ │     │
-│  └─────┬─────┘                 │  Instance   │  │ Manager  │ │     │
-│        │                       └──────┬──────┘  └──────────┘ │     │
-│        │                              │                      │     │
-│        ▼                              │ CAT/Audio            │     │
-│  ┌───────────┐                        ▼                      │     │
-│  │  QSO      │                 ┌─────────────┐               │     │
-│  │  State    │                 │    Radio    │               │     │
-│  │  Machine  │                 │  (IC-7300)  │               │     │
-│  └─────┬─────┘                 └─────────────┘               │     │
-│        │                                                     │     │
-│        ▼                                                     │     │
-│  ┌───────────┐    UDP 2237     ┌─────────────┐               │     │
-│  │ UdpSender │────────────────►│   WSJT-X    │               │     │
-│  └───────────┘                 └─────────────┘               │     │
-│        └─────────────────────────────────────────────────────┘     │
-│                                                                     │
-│  ┌─────────────┐                              ┌─────────────────┐   │
-│  │ Web Browser │◄─────HTTP:3000/WS───────────►│  Web Dashboard  │   │
-│  └─────────────┘                              └─────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### FlexRadio Mode Architecture
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Windows PC                                      │
-│  ┌─────────────┐                                   ┌─────────────────┐      │
-│  │  AI Agent   │◄──────────MCP/stdio──────────────►│   MCP Server    │      │
-│  │  (Claude)   │                                   │   (Node.js)     │      │
-│  └─────────────┘                                   └────────┬────────┘      │
-│                                                             │               │
-│                    ┌────────────────────────────────────────┼───────┐       │
-│                    │                                        │       │       │
-│                    ▼                                        ▼       │       │
-│            ┌─────────────┐                          ┌─────────────┐ │       │
-│            │ FlexClient  │                          │WsjtxManager │ │       │
-│            │ (VITA 49)   │                          └──────┬──────┘ │       │
-│            └──────┬──────┘                                 │        │       │
-│                   │                                        │        │       │
-│                   │ TCP 4992                               │        │       │
-│                   │ (slice events)                         │        │       │
-│                   ▼                                        │        │       │
-│            ┌─────────────┐                                 │        │       │
-│            │SliceMaster  │◄────────────────────────────────┘        │       │
-│            │   Logic     │                                          │       │
-│            └──────┬──────┘                                          │       │
-│                   │                                                 │       │
-│                   │ auto-launch/terminate                           │       │
-│                   ▼                                                 │       │
-│  ┌────────────────────────────────────────────────────────────────┐ │       │
-│  │              Per-Slice WSJT-X Instances                        │ │       │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │ │       │
-│  │  │  WSJT-X     │  │  WSJT-X     │  │  WSJT-X     │  ...        │ │       │
-│  │  │  Slice A    │  │  Slice B    │  │  Slice C    │             │ │       │
-│  │  │ --rig-name  │  │ --rig-name  │  │ --rig-name  │             │ │       │
-│  │  │  =SliceA    │  │  =SliceB    │  │  =SliceC    │             │ │       │
-│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │ │       │
-│  │         │                │                │                    │ │       │
-│  │         │ UDP 2237       │ UDP 2237       │ UDP 2237           │ │       │
-│  │         │ (all instances)│                │                    │ │       │
-│  │         └────────────────┼────────────────┘                    │ │       │
-│  │                          ▼                                     │ │       │
-│  │                   ┌─────────────┐                              │ │       │
-│  │                   │ UdpListener │──────────────────────────────┼─┘       │
-│  │                   └─────────────┘                              │         │
-│  │                                                                │         │
-│  │         CAT Server TCP   DAX Audio                             │         │
-│  │         ┌────────────────┬────────────────┐                    │         │
-│  │         │ Port 7831      │ DAX RX 1       │◄── Slice A         │         │
-│  │         │ Port 7832      │ DAX RX 2       │◄── Slice B         │         │
-│  │         │ Port 7833      │ DAX RX 3       │◄── Slice C         │         │
-│  │         │ Port 7834      │ DAX RX 4       │◄── Slice D         │         │
-│  │         └────────┬───────┴───────┬────────┘                    │         │
-│  └──────────────────┼───────────────┼─────────────────────────────┘         │
-│                     │               │                                       │
-│                     ▼               ▼                                       │
-│            ┌──────────────────────────────────┐                             │
-│            │         SmartSDR                 │                             │
-│            │  ┌────────┐ ┌────────┐           │                             │
-│            │  │Slice A │ │Slice B │ ...       │                             │
-│            │  │ 20m FT8│ │ 40m FT8│           │                             │
-│            │  └────────┘ └────────┘           │                             │
-│            └───────────────┬──────────────────┘                             │
-│                            │                                                │
-└────────────────────────────┼────────────────────────────────────────────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   FlexRadio     │
-                    │  (FLEX-6600)    │
-                    └─────────────────┘
-```
-
-#### FlexRadio Audio/CAT Data Flow
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    WSJT-X ◄──► FlexRadio Integration                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│   WSJT-X Instance                MCP Server           FlexRadio     │
-│  ┌─────────────────┐         ┌─────────────┐     ┌─────────────┐   │
-│  │                 │         │             │     │             │   │
-│  │  Audio Input    │◄────────│─────────────│─────│ DAX RX 1    │   │
-│  │  "DAX RX 1"     │         │             │     │             │   │
-│  │                 │         │             │     │             │   │
-│  │  Audio Output   │─────────│─────────────│────►│ DAX TX      │   │
-│  │  "DAX TX"       │         │             │     │             │   │
-│  │                 │         │             │     │             │   │
-│  │  CAT Control    │◄───────►│  CatServer  │────►│ VITA 49     │   │
-│  │  127.0.0.1:7831 │ Kenwood │  (built-in) │     │ slice tune  │   │
-│  │  (Ham Radio DX) │ TS-2000 │             │     │ slice set   │   │
-│  └─────────────────┘         └─────────────┘     └─────────────┘   │
-│                                                                     │
-│  CAT Command Translation:                                           │
-│  • FA00014074000; → slice tune 0 14.074 (frequency)                 │
-│  • MD9;           → slice set 0 mode=DIGU (mode)                    │
-│  • TX;            → xmit 1 (PTT on)                                 │
-│  • RX;            → xmit 0 (PTT off)                                │
-│                                                                     │
-│  WSJT-X INI Configuration (auto-configured):                        │
-│  • Rig: Ham Radio Deluxe                                            │
-│  • CATNetworkPort: 127.0.0.1:7831 (7832, 7833, 7834 for B,C,D)     │
-│  • SoundInName: DAX Audio RX 1 (FlexRadio Systems DAX Audio)       │
-│  • SoundOutName: DAX Audio TX (FlexRadio Systems DAX TX)           │
-│  • PTTMethod: CAT                                                   │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 3.4. Message Flow (Internal)
+### 3.3. Message Flow
 ```
 AI Agent <--MCP/stdio--> McpServer
                            ↓
                       WsjtxManager
                       ↓         ↓
-                UdpListener  ProcessManager (Standard) / SliceMasterLogic (Flex)
+                UdpListener  ProcessManager
                       ↓         ↓
               QsoStateMachine  WSJT-X Process(es)
                       ↓         ↓
@@ -361,63 +205,13 @@ Handled message types (defined in `src/wsjtx/types.ts`):
 - **Default Host**: 255.255.255.255 (broadcast discovery), configurable
 - **Default Port**: 4992
 - **Protocol**: VITA 49 packet format for SDR control
-- **Commands Implemented**:
-  - `sub slice all` - Subscribe to slice events
-  - `slice list` - Get current slice list
-  - `slice tune <index> <freq_mhz>` - Tune slice to frequency
-  - `slice set <index> mode=<mode>` - Set slice mode
-  - `xmit <0|1>` - PTT control
 
-### 7.2. Built-in CAT Server
-The MCP server includes a built-in CAT server that eliminates the need for external SmartCAT software:
-
-- **Protocol**: Kenwood TS-2000 compatible CAT commands over TCP
-- **Ports**: 7831 (Slice A), 7832 (Slice B), 7833 (Slice C), 7834 (Slice D)
-- **Rig Type in WSJT-X**: "Ham Radio Deluxe"
-- **Supported Commands**:
-  - `FA;` / `FA<freq>;` - Query/Set VFO A frequency
-  - `FB;` / `FB<freq>;` - Query/Set VFO B frequency
-  - `IF;` - Transceiver info (frequency, mode, TX state)
-  - `MD;` / `MD<mode>;` - Query/Set mode
-  - `TX;` / `RX;` - PTT control
-  - `TQ;` - TX state query
-  - `ID;` - Radio ID (returns TS-2000)
-  - `PS;` - Power status
-  - `AI;` - Auto-information mode
-
-**Implementation**: `src/flex/CatServer.ts`
-- `CatServer` class: Single-slice CAT server
-- `CatServerManager` class: Manages multiple CAT servers (one per slice)
-- Events emitted: `frequency-change`, `mode-change`, `ptt-change`
-
-### 7.3. Slice Master Logic
+### 7.2. Slice Master Logic
 - **Slice Detection**: Monitors `slice-added`, `slice-removed`, `slice-updated` events
-- **Auto-Launch**: Creates WSJT-X instance when slice added (any mode)
+- **Auto-Launch**: Creates WSJT-X instance when digital slice added
 - **Auto-Terminate**: Stops WSJT-X instance when slice removed
-- **CAT Server**: Starts CAT server before launching WSJT-X
-- **State Sync**: Updates CAT server when FlexRadio reports slice changes
+- **Configuration Sync**: Updates WSJT-X when slice frequency/mode changes
 - **Instance Mapping**: Maintains slice ID to WSJT-X instance mapping
-- **Naming**: Instances named "Slice-A", "Slice-B", etc.
-
-### 7.4. WSJT-X INI Configuration
-The system auto-configures WSJT-X INI files before launching:
-
-**Implementation**: `src/wsjtx/WsjtxConfig.ts`
-
-**Configured Settings**:
-- `Rig=Ham Radio Deluxe`
-- `CATNetworkPort=127.0.0.1:<port>` (combined IP:port format)
-- `PTTMethod=CAT`
-- `SoundInName=DAX Audio RX <n> (FlexRadio Systems DAX Audio)`
-- `SoundOutName=DAX Audio TX (FlexRadio Systems DAX TX)`
-- `AudioInputChannel=Mono`
-- `AudioOutputChannel=Mono`
-
-**Wide Graph Settings**:
-- `BinsPerPixel` - Calculated for 2500 Hz display
-- `PlotWidth` - Calculated based on window size
-- `StartFreq=0`
-- `HideControls=true`
 
 ## 8. Web Dashboard
 
@@ -451,64 +245,11 @@ The system auto-configures WSJT-X INI files before launching:
 - **Process Control**: Node.js child_process module
 
 ### 9.2. Configuration
-
-Configuration is stored in `config.json` and can be edited via the Web Dashboard Settings page.
-
-#### Common Parameters (Both Modes)
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `mode` | Operation mode: "STANDARD" or "FLEX" | STANDARD |
-| `wsjtx.path` | Path to WSJT-X executable | C:\WSJT\wsjtx\bin\wsjtx.exe |
-| `station.callsign` | Your callsign (for QSO automation) | (empty) |
-| `station.grid` | Your grid locator (for QSO automation) | (empty) |
-
-#### Standard Mode Parameters
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `standard.rigName` | Rig name for WSJT-X instance identification | IC-7300 |
-
-#### FlexRadio Mode Parameters
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `flex.host` | FlexRadio/SmartSDR IP address | 127.0.0.1 (auto-discovered) |
-| `flex.catBasePort` | Starting TCP port for CAT server (increments per slice) | 7831 |
-
-#### Example config.json (Standard Mode)
-```json
-{
-  "mode": "STANDARD",
-  "wsjtx": {
-    "path": "C:\\WSJT\\wsjtx\\bin\\wsjtx.exe"
-  },
-  "station": {
-    "callsign": "W1ABC",
-    "grid": "FN31"
-  },
-  "standard": {
-    "rigName": "IC-7300"
-  }
-}
-```
-
-#### Example config.json (FlexRadio Mode)
-```json
-{
-  "mode": "FLEX",
-  "wsjtx": {
-    "path": "C:\\WSJT\\wsjtx\\bin\\wsjtx.exe"
-  },
-  "station": {
-    "callsign": "W1ABC",
-    "grid": "FN31"
-  },
-  "flex": {
-    "host": "auto",
-    "catBasePort": 7831
-  }
-}
-```
-
-**Note**: When `flex.host` is "auto" or not specified, the system will auto-discover FlexRadio on the network via broadcast UDP.
+Environment variables:
+- `WSJTX_MODE`: "FLEX" or "STANDARD" (default: STANDARD)
+- `FLEX_HOST`: FlexRadio host IP (default: 255.255.255.255)
+- `RIG_NAME`: Standard mode rig name (default: IC-7300)
+- `RIG_PORT`: Standard mode serial port (optional)
 
 Configuration validated via Zod schemas in `src/config.ts`
 
@@ -523,51 +264,115 @@ Configuration validated via Zod schemas in `src/config.ts`
 - **Production Build**: `npx tsc` to compile TypeScript
 - **Output**: dist/ directory with CommonJS modules
 - **Frontend Build**: `cd frontend && npm run build`
-- **Single Binary**: Future support for pkg or bun compilation
+- **Single Binary**: pkg or bun compilation for standalone distribution
 
-## 10. Future Enhancements
+## 10. Additional MCP Tools
 
-### 10.1. Not Yet Implemented
-The following FSD features are not yet implemented:
+### `set_parameter`
+**Parameters**:
+- `name` (string, required): Instance name
+- `parameter` (string, required): Parameter to set
+- `value` (any, required): Parameter value
 
-**MCP Tools**:
-- `set_parameter`: Generic parameter setting
-- `call_cq`: Standalone CQ call (currently part of execute_qso)
-- `reply_to_station`: Direct reply without full QSO (currently part of execute_qso)
-- `halt_tx`: Emergency transmission stop
-- `set_frequency`: Direct frequency control
-- `set_mode`: Direct mode switching
+**Behavior**: Sets generic WSJT-X configuration parameters
 
-**MCP Resources**:
-- `wsjt-x://{name}/decodes`: Instance-specific decode stream
-- `wsjt-x://{name}/status`: Instance-specific status
+**Returns**: Success message or error
 
-**Monitoring**:
-- Station info (own callsign/grid) not exposed as MCP resource
-- Configuration parameters not exposed as MCP resource
+### `call_cq`
+**Parameters**:
+- `name` (string, required): Instance name
+- `message` (string, optional): Custom CQ message
 
-### 10.2. Planned Features
-- Pre-built binaries for Windows x64 and Raspberry Pi ARM64
-- Extended rig control tools (frequency, mode, parameters)
-- Individual instance decode/status resources
-- Enhanced error recovery in QSO state machine
-- Logging to file for QSOs and events
-- Configuration UI in web dashboard
+**Behavior**: Initiates standalone CQ call sequence without full QSO automation
 
-## 11. Status
-- ✅ Core architecture implemented
-- ✅ Both operation modes (FLEX and STANDARD) functional
-- ✅ QSO state machine complete
-- ✅ Process management operational
-- ✅ UDP protocol implementation complete
-- ✅ MCP server with stdio transport
-- ✅ Web dashboard basic implementation
-- ✅ FlexRadio VITA 49 integration
-- ✅ **Built-in CAT server** (Kenwood TS-2000 compatible) - No external SmartCAT needed
-- ✅ **Auto-configuration of WSJT-X INI files** (rig, audio, wide graph settings)
-- ✅ **FlexRadio auto-discovery** via UDP broadcast
-- ✅ **Slice-aware instance naming** (Slice-A, Slice-B, etc.)
-- ✅ **Bidirectional CAT control** (WSJT-X → FlexRadio frequency/mode/PTT)
-- ⏳ Additional MCP tools pending
-- ⏳ Binary distribution pending
-- ⏳ Enhanced web dashboard features pending
+**Returns**: Success message or error
+
+### `reply_to_station`
+**Parameters**:
+- `name` (string, required): Instance name
+- `callsign` (string, required): Station callsign to reply to
+
+**Behavior**: Sends direct reply to specific station without full QSO automation
+
+**Returns**: Success message or error
+
+### `halt_tx`
+**Parameters**:
+- `name` (string, required): Instance name
+
+**Behavior**: Emergency stop of active transmission
+
+**Returns**: Success message or error
+
+### `set_frequency`
+**Parameters**:
+- `name` (string, required): Instance name
+- `frequency` (number, required): Frequency in Hz
+
+**Behavior**: Tunes radio to specified frequency
+
+**Returns**: Success message or error
+
+### `set_mode`
+**Parameters**:
+- `name` (string, required): Instance name
+- `mode` (string, required): Operating mode (FT8, FT4, JT65, etc.)
+
+**Behavior**: Switches WSJT-X operating mode
+
+**Returns**: Success message or error
+
+## 11. Additional MCP Resources
+
+### `wsjt-x://{name}/decodes`
+**Type**: JSON stream
+**Content**: Real-time decoded messages for specific instance
+**Use Case**: Monitor decode activity for single instance
+
+### `wsjt-x://{name}/status`
+**Type**: JSON object
+**Content**: Current operational status for specific instance including frequency, mode, Tx/Rx state
+**Use Case**: Query status of individual instance
+
+### `wsjt-x://{name}/station-info`
+**Type**: JSON object
+**Content**: Station configuration including callsign and grid locator
+**Use Case**: Retrieve station identification information
+
+### `wsjt-x://{name}/config`
+**Type**: JSON object
+**Content**: Current WSJT-X configuration parameters
+**Use Case**: Query instance configuration settings
+
+## 12. Distribution
+
+### Binary Packages
+- **Windows x64**: Standalone executable for Windows systems
+- **Raspberry Pi ARM64**: Optimized binary for Raspberry Pi deployment
+- **Cross-platform**: npm package for any Node.js v18+ environment
+
+### Packaging
+- Single binary compilation using pkg or bun
+- Embedded Node.js runtime
+- No external dependencies required for binary distribution
+
+## 13. Enhanced Features
+
+### QSO State Machine
+- Advanced error recovery with exponential backoff
+- Configurable retry strategies per state
+- Multiple QSO patterns (contest mode, casual mode, DX mode)
+- Signal quality-based decision making
+
+### Logging
+- QSO logging to ADIF format
+- System event logging to file
+- Structured JSON logs for analysis
+- Log rotation and archival
+
+### Web Dashboard
+- Configuration UI for system settings
+- Real-time waterfall display integration
+- QSO history viewer
+- Statistics and analytics dashboard
+- Multi-user access with authentication

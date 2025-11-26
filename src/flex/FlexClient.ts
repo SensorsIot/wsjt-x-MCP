@@ -57,4 +57,25 @@ export class FlexClient extends EventEmitter {
     public isConnected(): boolean {
         return this.vita49Client.isConnected();
     }
+
+    /**
+     * Tune a slice to a specific frequency
+     */
+    public tuneSlice(sliceIndex: number, frequencyHz: number): void {
+        this.vita49Client.tuneSlice(sliceIndex, frequencyHz);
+    }
+
+    /**
+     * Set mode for a slice
+     */
+    public setSliceMode(sliceIndex: number, mode: string): void {
+        this.vita49Client.setSliceMode(sliceIndex, mode);
+    }
+
+    /**
+     * Set PTT for a slice
+     */
+    public setSliceTx(sliceIndex: number, tx: boolean): void {
+        this.vita49Client.setSliceTx(sliceIndex, tx);
+    }
 }

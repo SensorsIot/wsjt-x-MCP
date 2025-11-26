@@ -34,6 +34,9 @@ export const ConfigSchema = z.object({
     flex: z.object({
         host: z.string().default('127.0.0.1'),
         catBasePort: z.number().default(60000), // SmartCAT TCP port (increments per slice)
+        // Default FT8 dial frequencies for each slice (in Hz)
+        // Slice A=index 0, B=index 1, etc.
+        defaultBands: z.array(z.number()).optional(), // e.g., [28074000, 21074000, 14074000, 7074000]
     }),
     // Dashboard station tracking settings
     dashboard: z.object({
@@ -48,8 +51,8 @@ export const ConfigSchema = z.object({
             strong: z.string().default('#22c55e'),       // green-500
             priority: z.string().default('#f97316'),     // orange-500
             new_dxcc: z.string().default('#ec4899'),     // pink-500
-        }).default({}),
-    }).default({}),
+        }).optional(),
+    }).optional(),
     // Internal parameters (not user-configurable)
     mcp: z.object({
         name: z.string().default('wsjt-x-mcp'),

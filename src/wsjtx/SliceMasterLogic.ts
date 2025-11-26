@@ -2,80 +2,140 @@ import { EventEmitter } from 'events';
 import { FlexSlice } from '../flex/Vita49Client';
 import { ProcessManager } from './ProcessManager';
 import { positionWsjtxWindows, calculateLayout } from './WindowManager';
-import { configureWideGraph, configureRigForSmartCat, SMARTCAT_BASE_PORT } from './WsjtxConfig';
-import { CatServerManager } from '../flex/CatServer';
+import { configureWideGraph, configureRigForHrdCat, HRD_CAT_BASE_PORT } from './WsjtxConfig';
+import { HrdCatServer } from '../cat/HrdCatServer';
 
 // WSJT-X uses ~1.46 Hz per bin for FT8 (sample rate 12000 / 8192 FFT bins)
 const HZ_PER_BIN = 1.4648;
 
+/**
+ * SliceMasterLogic - Manages WSJT-X instances for FlexRadio slices
+ *
+ * Architecture (mimics SliceMaster):
+ * - Each FlexRadio slice gets its own WSJT-X instance
+ * - WSJT-X connects to our HRD CAT server (Ham Radio Deluxe protocol)
+ * - We translate HRD commands to FlexRadio API calls
+ * - Bidirectional sync: WSJT-X tune -> slice moves, slice tune -> WSJT-X follows
+ * - No SmartSDR CAT needed - our HRD TCP shim replaces it
+ */
+export interface StationConfig {
+    callsign?: string;
+    grid?: string;
+}
+
 export class SliceMasterLogic extends EventEmitter {
     private processManager: ProcessManager;
     private sliceToInstance: Map<string, string> = new Map();
-    private smartCatHost: string;
-    private catServerManager: CatServerManager;
-    private sliceIndexMap: Map<string, number> = new Map(); // sliceId -> sliceIndex
+    private sliceIndexMap: Map<string, number> = new Map();
+    private catServers: Map<number, HrdCatServer> = new Map();
+    private basePort: number;
+    private stationConfig: StationConfig;
 
-    constructor(processManager: ProcessManager, smartCatHost: string = '127.0.0.1') {
+    constructor(processManager: ProcessManager, basePort: number = HRD_CAT_BASE_PORT, stationConfig: StationConfig = {}) {
         super();
         this.processManager = processManager;
-        this.smartCatHost = smartCatHost;
-        this.catServerManager = new CatServerManager(SMARTCAT_BASE_PORT);
-
-        // Forward CAT events for frequency/mode changes from WSJT-X
-        this.catServerManager.on('frequency-change', (sliceIndex, freq) => {
-            console.log(`CAT: Slice ${sliceIndex} frequency change request: ${freq} Hz`);
-            this.emit('cat-frequency-change', sliceIndex, freq);
-        });
-        this.catServerManager.on('mode-change', (sliceIndex, mode) => {
-            console.log(`CAT: Slice ${sliceIndex} mode change request: ${mode}`);
-            this.emit('cat-mode-change', sliceIndex, mode);
-        });
-        this.catServerManager.on('ptt-change', (sliceIndex, tx) => {
-            console.log(`CAT: Slice ${sliceIndex} PTT: ${tx ? 'TX' : 'RX'}`);
-            this.emit('cat-ptt-change', sliceIndex, tx);
-        });
+        this.basePort = basePort;
+        this.stationConfig = stationConfig;
     }
 
     /**
-     * Get the CAT server manager (for external integration)
+     * Update station configuration (callsign, grid)
+     * Used when settings are changed from the frontend
      */
-    public getCatServerManager(): CatServerManager {
-        return this.catServerManager;
+    public setStationConfig(config: StationConfig): void {
+        this.stationConfig = config;
+        console.log(`[SliceMaster] Station config updated: ${config.callsign || '(no callsign)'} / ${config.grid || '(no grid)'}`);
     }
 
-    /**
-     * Extract slice index from slice ID (e.g., "slice_0" -> 0)
-     */
+    private getCatPort(sliceIndex: number): number {
+        return this.basePort + sliceIndex;
+    }
+
     private getSliceIndex(sliceId: string): number {
         const match = sliceId.match(/slice_(\d+)/);
         return match ? parseInt(match[1]) : 0;
     }
 
-    /**
-     * Get DAX channel for a slice (1-indexed, slice 0 = DAX 1)
-     */
     private getDaxChannel(sliceIndex: number): number {
         return sliceIndex + 1;
     }
 
-    /**
-     * Get SmartCAT port for a slice
-     */
-    private getSmartCatPort(sliceIndex: number): number {
-        return SMARTCAT_BASE_PORT + sliceIndex;
+    private getSliceLetter(sliceIndex: number): string {
+        return String.fromCharCode(65 + sliceIndex);
     }
 
     /**
-     * Get slice letter from index (0=A, 1=B, etc.)
+     * Start HRD CAT server for a slice
      */
-    private getSliceLetter(sliceIndex: number): string {
-        return String.fromCharCode(65 + sliceIndex); // 65 = 'A'
+    private async startCatServer(sliceIndex: number, initialFrequency: number): Promise<HrdCatServer> {
+        const port = this.getCatPort(sliceIndex);
+        const sliceLetter = this.getSliceLetter(sliceIndex);
+
+        const server = new HrdCatServer({
+            port,
+            sliceIndex,
+            sliceLetter,
+        });
+
+        // Set initial frequency from FlexRadio slice
+        server.setFrequency(initialFrequency);
+
+        // Forward HRD commands to FlexRadio via events
+        server.on('frequency-change', (idx: number, freq: number) => {
+            console.log(`[SliceMaster] WSJT-X Slice ${this.getSliceLetter(idx)} tuned to ${(freq / 1e6).toFixed(6)} MHz`);
+            this.emit('cat-frequency-change', idx, freq);
+        });
+
+        server.on('mode-change', (idx: number, mode: string) => {
+            console.log(`[SliceMaster] WSJT-X Slice ${this.getSliceLetter(idx)} mode changed to ${mode}`);
+            this.emit('cat-mode-change', idx, mode);
+        });
+
+        server.on('ptt-change', (idx: number, ptt: boolean) => {
+            console.log(`[SliceMaster] WSJT-X Slice ${this.getSliceLetter(idx)} PTT ${ptt ? 'ON' : 'OFF'}`);
+            this.emit('cat-ptt-change', idx, ptt);
+        });
+
+        await server.start();
+        this.catServers.set(sliceIndex, server);
+
+        return server;
+    }
+
+    /**
+     * Stop HRD CAT server for a slice
+     */
+    private stopCatServer(sliceIndex: number): void {
+        const server = this.catServers.get(sliceIndex);
+        if (server) {
+            server.stop();
+            this.catServers.delete(sliceIndex);
+        }
+    }
+
+    /**
+     * Update HRD CAT server frequency (called when FlexRadio slice changes)
+     * This enables bidirectional sync: slice tune in SmartSDR -> WSJT-X follows
+     */
+    public updateSliceFrequency(sliceIndex: number, frequency: number): void {
+        const server = this.catServers.get(sliceIndex);
+        if (server) {
+            server.setFrequency(frequency);
+            console.log(`[SliceMaster] Updated CAT server ${this.getSliceLetter(sliceIndex)} frequency to ${(frequency / 1e6).toFixed(6)} MHz`);
+        }
+    }
+
+    /**
+     * Update HRD CAT server mode (called when FlexRadio slice changes)
+     */
+    public updateSliceMode(sliceIndex: number, mode: string): void {
+        const server = this.catServers.get(sliceIndex);
+        if (server) {
+            server.setMode(mode);
+        }
     }
 
     public async handleSliceAdded(slice: FlexSlice): Promise<void> {
-        // Launch WSJT-X for ANY slice - WSJT-X will control the mode (set to DIGU)
-        // The user doesn't need to pre-select digital mode; WSJT-X handles it
-
         if (this.sliceToInstance.has(slice.id)) {
             console.log(`Instance already exists for slice ${slice.id}`);
             return;
@@ -84,45 +144,38 @@ export class SliceMasterLogic extends EventEmitter {
         const sliceIndex = this.getSliceIndex(slice.id);
         const sliceLetter = this.getSliceLetter(sliceIndex);
         const daxChannel = slice.daxChannel || this.getDaxChannel(sliceIndex);
-        const smartCatPort = this.getSmartCatPort(sliceIndex);
+        const catPort = this.getCatPort(sliceIndex);
+        const udpPort = 2237 + sliceIndex;
 
-        // Generate instance name matching SliceMaster convention: "Slice-A", "Slice-B", etc.
         const instanceName = `Slice-${sliceLetter}`;
         const freqMHz = (slice.frequency / 1e6).toFixed(3);
 
         console.log(`\n=== Auto-launching WSJT-X for slice ${slice.id} ===`);
         console.log(`  Instance Name: ${instanceName}`);
-        console.log(`  Slice Letter: ${sliceLetter}`);
         console.log(`  Frequency: ${freqMHz} MHz`);
         console.log(`  Mode: ${slice.mode}`);
         console.log(`  DAX Channel: ${daxChannel}`);
-        console.log(`  SmartCAT Port: ${smartCatPort}`);
-        console.log(`  SmartCAT Host: ${this.smartCatHost}`);
+        console.log(`  HRD CAT Port: ${catPort}`);
+        console.log(`  UDP Port: ${udpPort}`);
 
-        // Start CAT server for this slice BEFORE launching WSJT-X
+        // Store slice index mapping
+        this.sliceIndexMap.set(slice.id, sliceIndex);
+
+        // Start HRD CAT server FIRST (before WSJT-X tries to connect)
         try {
-            await this.catServerManager.startServer(sliceIndex, {
-                frequency: slice.frequency,
-                mode: slice.mode,
-                tx: false
-            });
-            this.sliceIndexMap.set(slice.id, sliceIndex);
-        } catch (err) {
-            console.error(`Failed to start CAT server for slice ${sliceIndex}:`, err);
+            await this.startCatServer(sliceIndex, slice.frequency);
+            console.log(`  HRD CAT server started on port ${catPort}`);
+        } catch (error) {
+            console.error(`  Failed to start HRD CAT server:`, error);
             return;
         }
 
-        // Calculate layout to get BinsPerPixel for 2500 Hz display
+        // Configure Wide Graph
         const layout = calculateLayout({ sliceIndex });
-
-        // Configure Wide Graph settings BEFORE launching WSJT-X
-        // Calculate plotWidth for 2500 Hz display: plotWidth = targetHz / (binsPerPixel * HZ_PER_BIN)
         const targetFreqHz = 2500;
         const plotWidth = Math.ceil(targetFreqHz / (layout.binsPerPixel * HZ_PER_BIN));
 
-        console.log(`  Configuring Wide Graph for ${targetFreqHz} Hz display...`);
-        console.log(`  BinsPerPixel: ${layout.binsPerPixel}`);
-        console.log(`  PlotWidth: ${plotWidth} pixels`);
+        console.log(`  Configuring Wide Graph: BinsPerPixel=${layout.binsPerPixel}, PlotWidth=${plotWidth}`);
         configureWideGraph(instanceName, {
             binsPerPixel: layout.binsPerPixel,
             startFreq: 0,
@@ -130,11 +183,14 @@ export class SliceMasterLogic extends EventEmitter {
             plotWidth: plotWidth,
         });
 
-        // Configure Rig/CAT settings for SmartCAT
-        configureRigForSmartCat(instanceName, {
-            smartCatHost: this.smartCatHost,
-            smartCatPort: smartCatPort,
+        // Configure Rig for HRD CAT (Ham Radio Deluxe protocol)
+        configureRigForHrdCat(instanceName, {
+            sliceIndex: sliceIndex,
+            catPort: catPort,
             daxChannel: daxChannel,
+            udpPort: udpPort,
+            callsign: this.stationConfig.callsign,
+            grid: this.stationConfig.grid,
         });
 
         try {
@@ -143,8 +199,6 @@ export class SliceMasterLogic extends EventEmitter {
                 rigName: instanceName,
                 sliceIndex: sliceIndex,
                 daxChannel: daxChannel,
-                smartCatPort: smartCatPort,
-                smartCatHost: this.smartCatHost,
             });
 
             this.sliceToInstance.set(slice.id, instanceName);
@@ -153,33 +207,35 @@ export class SliceMasterLogic extends EventEmitter {
                 instanceName,
                 sliceLetter,
                 daxChannel,
-                smartCatPort
+                catPort,
+                frequency: slice.frequency,
+                udpPort: udpPort,
             });
 
-            // Position windows after launch (async, don't block)
             positionWsjtxWindows(instanceName, sliceIndex).catch(err => {
                 console.error(`Failed to position windows for ${instanceName}:`, err);
             });
         } catch (error) {
             console.error(`Failed to launch instance for slice ${slice.id}:`, error);
+            // Stop CAT server if WSJT-X failed to start
+            this.stopCatServer(sliceIndex);
         }
     }
 
     public handleSliceRemoved(slice: FlexSlice): void {
         const instanceName = this.sliceToInstance.get(slice.id);
-        if (!instanceName) {
-            return;
-        }
+        if (!instanceName) return;
+
+        const sliceIndex = this.sliceIndexMap.get(slice.id);
 
         console.log(`\n=== Stopping instance ${instanceName} for removed slice ${slice.id} ===`);
 
-        // Stop CAT server for this slice
-        const sliceIndex = this.sliceIndexMap.get(slice.id);
+        // Stop HRD CAT server
         if (sliceIndex !== undefined) {
-            this.catServerManager.stopServer(sliceIndex);
-            this.sliceIndexMap.delete(slice.id);
+            this.stopCatServer(sliceIndex);
         }
 
+        this.sliceIndexMap.delete(slice.id);
         this.processManager.stopInstance(instanceName);
         this.sliceToInstance.delete(slice.id);
         this.emit('instance-stopped', { sliceId: slice.id, instanceName });
@@ -188,13 +244,17 @@ export class SliceMasterLogic extends EventEmitter {
     public handleSliceUpdated(slice: FlexSlice): void {
         const instanceName = this.sliceToInstance.get(slice.id);
         if (instanceName) {
-            const freqMHz = (slice.frequency / 1e6).toFixed(3);
-            console.log(`Slice ${slice.id} updated: ${freqMHz} MHz, ${slice.mode}`);
-
-            // Update CAT server state so WSJT-X sees current frequency/mode
             const sliceIndex = this.sliceIndexMap.get(slice.id);
             if (sliceIndex !== undefined) {
-                this.catServerManager.updateSliceState(sliceIndex, {
+                // Update HRD CAT server state so WSJT-X gets correct frequency when it polls
+                this.updateSliceFrequency(sliceIndex, slice.frequency);
+                if (slice.mode) {
+                    this.updateSliceMode(sliceIndex, slice.mode);
+                }
+
+                this.emit('slice-updated', {
+                    sliceId: slice.id,
+                    sliceIndex,
                     frequency: slice.frequency,
                     mode: slice.mode
                 });
@@ -202,14 +262,16 @@ export class SliceMasterLogic extends EventEmitter {
         }
     }
 
-    /**
-     * Stop all CAT servers (call on shutdown)
-     */
-    public stopAllCatServers(): void {
-        this.catServerManager.stopAll();
-    }
-
     public getSliceMapping(): Map<string, string> {
         return new Map(this.sliceToInstance);
+    }
+
+    /**
+     * Stop all CAT servers and instances
+     */
+    public stopAll(): void {
+        for (const sliceIndex of this.catServers.keys()) {
+            this.stopCatServer(sliceIndex);
+        }
     }
 }

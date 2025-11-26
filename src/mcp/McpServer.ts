@@ -2,15 +2,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { WsjtxManager } from "../wsjtx/WsjtxManager";
+import { FlexClient } from "../flex/FlexClient";
 import { Config } from "../config";
 
 export class WsjtxMcpServer {
     private server: McpServer;
     private wsjtxManager: WsjtxManager;
+    private flexClient: FlexClient | null;
     private config: Config;
 
-    constructor(wsjtxManager: WsjtxManager, config: Config) {
+    constructor(wsjtxManager: WsjtxManager, config: Config, flexClient?: FlexClient) {
         this.wsjtxManager = wsjtxManager;
+        this.flexClient = flexClient || null;
         this.config = config;
 
         this.server = new McpServer({
@@ -100,6 +103,545 @@ export class WsjtxMcpServer {
                 }
             }
         );
+
+        // === Rig Control Tools (per Rig-control.md) ===
+
+        // Tool: rig_get_state
+        this.server.tool(
+            "rig_get_state",
+            "Get current state of all FlexRadio slices",
+            {},
+            async () => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                const slices = this.flexClient.getSlices();
+                const state = slices.map((slice) => {
+                    // Extract slice index from slice.id (e.g., "slice_0" -> 0)
+                    const match = slice.id.match(/slice_(\d+)/);
+                    const index = match ? parseInt(match[1]) : 0;
+                    return {
+                        id: String.fromCharCode(65 + index),  // A, B, C, D
+                        index: index,
+                        freq_hz: slice.frequency,
+                        freq_mhz: (slice.frequency / 1e6).toFixed(6),
+                        mode: slice.mode,
+                        dax_rx_channel: slice.daxChannel || (index + 1),
+                        is_active: slice.active
+                    };
+                });
+
+                return {
+                    content: [{ type: "text" as const, text: JSON.stringify({ slices: state }, null, 2) }],
+                };
+            }
+        );
+
+        // Tool: rig_tune_slice
+        this.server.tool(
+            "rig_tune_slice",
+            "Tune a slice to a specific frequency",
+            {
+                slice_index: z.number().min(0).max(3).describe("Slice index (0=A, 1=B, 2=C, 3=D)"),
+                freq_hz: z.number().describe("Frequency in Hz (e.g., 14074000)"),
+            },
+            async ({ slice_index, freq_hz }) => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    this.flexClient.tuneSlice(slice_index, freq_hz);
+                    const freqMHz = (freq_hz / 1e6).toFixed(6);
+                    return {
+                        content: [{ type: "text" as const, text: `Tuned slice ${String.fromCharCode(65 + slice_index)} to ${freqMHz} MHz` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: rig_set_slice_mode
+        this.server.tool(
+            "rig_set_slice_mode",
+            "Set the mode for a slice (e.g., DIGU for FT8/FT4)",
+            {
+                slice_index: z.number().min(0).max(3).describe("Slice index (0=A, 1=B, 2=C, 3=D)"),
+                mode: z.string().describe("Mode (e.g., 'DIGU', 'USB', 'LSB', 'CW')"),
+            },
+            async ({ slice_index, mode }) => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    this.flexClient.setSliceMode(slice_index, mode.toUpperCase());
+                    return {
+                        content: [{ type: "text" as const, text: `Set slice ${String.fromCharCode(65 + slice_index)} mode to ${mode.toUpperCase()}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: rig_set_tx_slice
+        this.server.tool(
+            "rig_set_tx_slice",
+            "Designate a slice for TX (transmit)",
+            {
+                slice_index: z.number().min(0).max(3).describe("Slice index (0=A, 1=B, 2=C, 3=D)"),
+            },
+            async ({ slice_index }) => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    this.flexClient.setSliceTx(slice_index, true);
+                    return {
+                        content: [{ type: "text" as const, text: `Set slice ${String.fromCharCode(65 + slice_index)} as TX slice` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: rig_emergency_stop
+        this.server.tool(
+            "rig_emergency_stop",
+            "Emergency TX stop - immediately disable transmit on all slices",
+            {},
+            async () => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    // Disable TX on all slices
+                    for (let i = 0; i < 4; i++) {
+                        this.flexClient.setSliceTx(i, false);
+                    }
+                    return {
+                        content: [{ type: "text" as const, text: "EMERGENCY STOP: TX disabled on all slices" }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: rig_configure_slice
+        this.server.tool(
+            "rig_configure_slice",
+            "Configure a slice with frequency, mode, and optionally set as TX",
+            {
+                slice_index: z.number().min(0).max(3).describe("Slice index (0=A, 1=B, 2=C, 3=D)"),
+                freq_hz: z.number().describe("Frequency in Hz"),
+                mode: z.string().optional().describe("Mode (default: DIGU)"),
+                make_tx: z.boolean().optional().describe("Set this slice as TX slice"),
+            },
+            async ({ slice_index, freq_hz, mode, make_tx }) => {
+                if (!this.flexClient) {
+                    return {
+                        content: [{ type: "text" as const, text: "Error: Not connected to FlexRadio" }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    this.flexClient.tuneSlice(slice_index, freq_hz);
+                    this.flexClient.setSliceMode(slice_index, mode?.toUpperCase() || 'DIGU');
+                    if (make_tx) {
+                        this.flexClient.setSliceTx(slice_index, true);
+                    }
+
+                    const freqMHz = (freq_hz / 1e6).toFixed(6);
+                    const sliceLetter = String.fromCharCode(65 + slice_index);
+                    return {
+                        content: [{
+                            type: "text" as const,
+                            text: `Configured slice ${sliceLetter}: ${freqMHz} MHz, ${mode?.toUpperCase() || 'DIGU'}${make_tx ? ', TX enabled' : ''}`
+                        }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // === WSJT-X Control Tools (via UDP protocol) ===
+
+        // Tool: wsjtx_configure
+        this.server.tool(
+            "wsjtx_configure",
+            "Configure WSJT-X instance settings (mode, RX offset, DX call/grid). Note: Cannot change dial frequency - use rig_tune_slice for that.",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                mode: z.string().optional().describe("Mode (e.g., 'FT8', 'FT4', 'JT65')"),
+                rx_df: z.number().optional().describe("RX audio frequency offset in Hz"),
+                dx_call: z.string().optional().describe("DX station callsign"),
+                dx_grid: z.string().optional().describe("DX station grid locator"),
+                tr_period: z.number().optional().describe("T/R period in seconds (15 for FT8, 7.5 for FT4)"),
+            },
+            async ({ instance_id, mode, rx_df, dx_call, dx_grid, tr_period }) => {
+                try {
+                    this.wsjtxManager.configureInstance(instance_id, {
+                        mode,
+                        rxDF: rx_df,
+                        dxCall: dx_call,
+                        dxGrid: dx_grid,
+                        trPeriod: tr_period,
+                    });
+
+                    const changes: string[] = [];
+                    if (mode) changes.push(`mode=${mode}`);
+                    if (rx_df !== undefined) changes.push(`rx_df=${rx_df}Hz`);
+                    if (dx_call) changes.push(`dx_call=${dx_call}`);
+                    if (dx_grid) changes.push(`dx_grid=${dx_grid}`);
+                    if (tr_period) changes.push(`tr_period=${tr_period}s`);
+
+                    return {
+                        content: [{ type: "text" as const, text: `Configured ${instance_id}: ${changes.join(', ') || 'no changes'}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_switch_config
+        this.server.tool(
+            "wsjtx_switch_config",
+            "Switch WSJT-X to a named configuration profile. This can change band/frequency if the profile has different settings.",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                config_name: z.string().describe("Configuration profile name to switch to"),
+            },
+            async ({ instance_id, config_name }) => {
+                try {
+                    this.wsjtxManager.switchConfiguration(instance_id, config_name);
+                    return {
+                        content: [{ type: "text" as const, text: `Switched ${instance_id} to configuration: ${config_name}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_clear_decodes
+        this.server.tool(
+            "wsjtx_clear_decodes",
+            "Clear decode windows in WSJT-X",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                window: z.number().min(0).max(2).optional().describe("Window to clear: 0=Band Activity, 1=Rx Frequency, 2=Both (default)"),
+            },
+            async ({ instance_id, window }) => {
+                try {
+                    this.wsjtxManager.clearDecodes(instance_id, (window ?? 2) as 0 | 1 | 2);
+                    const windowNames = ['Band Activity', 'Rx Frequency', 'Both'];
+                    return {
+                        content: [{ type: "text" as const, text: `Cleared ${windowNames[window ?? 2]} window(s) on ${instance_id}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_halt_tx
+        this.server.tool(
+            "wsjtx_halt_tx",
+            "Stop transmission in WSJT-X",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                auto_tx_only: z.boolean().optional().describe("If true, only stop auto-TX; if false, stop all TX (default: true)"),
+            },
+            async ({ instance_id, auto_tx_only }) => {
+                try {
+                    this.wsjtxManager.haltTx(instance_id, auto_tx_only ?? true);
+                    return {
+                        content: [{ type: "text" as const, text: `Halted TX on ${instance_id}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_set_free_text
+        this.server.tool(
+            "wsjtx_set_free_text",
+            "Set free text message in WSJT-X",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                text: z.string().describe("Free text message to set"),
+                send: z.boolean().optional().describe("If true, immediately transmit the message (default: false)"),
+            },
+            async ({ instance_id, text, send }) => {
+                try {
+                    this.wsjtxManager.setFreeText(instance_id, text, send ?? false);
+                    return {
+                        content: [{ type: "text" as const, text: `Set free text on ${instance_id}: "${text}"${send ? ' (transmitting)' : ''}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_reply_to_station
+        this.server.tool(
+            "wsjtx_reply_to_station",
+            "Reply to a decoded station (simulates double-clicking a decode in WSJT-X)",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                time: z.number().describe("Decode time (milliseconds since midnight UTC)"),
+                snr: z.number().describe("Signal-to-noise ratio in dB"),
+                delta_time: z.number().describe("Time offset in seconds"),
+                delta_frequency: z.number().describe("Audio frequency offset in Hz"),
+                mode: z.string().describe("Mode (e.g., 'FT8', 'FT4')"),
+                message: z.string().describe("The decoded message to reply to"),
+            },
+            async ({ instance_id, time, snr, delta_time, delta_frequency, mode, message }) => {
+                try {
+                    this.wsjtxManager.replyToStation(instance_id, time, snr, delta_time, delta_frequency, mode, message);
+                    return {
+                        content: [{ type: "text" as const, text: `Replying to: ${message}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_highlight_callsign
+        this.server.tool(
+            "wsjtx_highlight_callsign",
+            "Highlight a callsign in the WSJT-X band activity window",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                callsign: z.string().describe("Callsign to highlight"),
+                bg_color: z.object({
+                    r: z.number().min(0).max(255),
+                    g: z.number().min(0).max(255),
+                    b: z.number().min(0).max(255),
+                }).describe("Background color RGB"),
+                fg_color: z.object({
+                    r: z.number().min(0).max(255),
+                    g: z.number().min(0).max(255),
+                    b: z.number().min(0).max(255),
+                }).describe("Foreground (text) color RGB"),
+            },
+            async ({ instance_id, callsign, bg_color, fg_color }) => {
+                try {
+                    this.wsjtxManager.highlightCallsign(instance_id, callsign, bg_color, fg_color);
+                    return {
+                        content: [{ type: "text" as const, text: `Highlighted ${callsign} on ${instance_id}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_set_location
+        this.server.tool(
+            "wsjtx_set_location",
+            "Set the station's Maidenhead grid location in WSJT-X",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                grid: z.string().describe("Maidenhead grid locator (e.g., 'FN20', 'JN47')"),
+            },
+            async ({ instance_id, grid }) => {
+                try {
+                    this.wsjtxManager.setLocation(instance_id, grid);
+                    return {
+                        content: [{ type: "text" as const, text: `Set location on ${instance_id} to ${grid}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_set_frequency
+        this.server.tool(
+            "wsjtx_set_frequency",
+            "Set dial frequency in WSJT-X. This tunes both WSJT-X and the radio (via CAT). Band changes automatically based on frequency.",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                freq_hz: z.number().describe("Dial frequency in Hz (e.g., 14074000 for 20m FT8, 7074000 for 40m FT8)"),
+                mode: z.string().optional().describe("Optional radio mode (e.g., 'USB', 'DIGU')"),
+            },
+            async ({ instance_id, freq_hz, mode }) => {
+                try {
+                    this.wsjtxManager.setFrequency(instance_id, freq_hz, mode);
+                    const freqMHz = (freq_hz / 1e6).toFixed(6);
+                    const band = this.frequencyToBand(freq_hz);
+                    return {
+                        content: [{ type: "text" as const, text: `Set ${instance_id} to ${freqMHz} MHz (${band})${mode ? ` in ${mode} mode` : ''}` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+
+        // Tool: wsjtx_tune_band
+        this.server.tool(
+            "wsjtx_tune_band",
+            "Tune WSJT-X to a specific band's default FT8 frequency",
+            {
+                instance_id: z.string().describe("WSJT-X instance ID (rig name)"),
+                band: z.enum(['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m', '2m']).describe("Amateur radio band"),
+                digital_mode: z.enum(['FT8', 'FT4']).optional().describe("Digital mode (default: FT8)"),
+            },
+            async ({ instance_id, band, digital_mode }) => {
+                const freq = this.getBandFrequency(band, digital_mode || 'FT8');
+                if (!freq) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: Unknown band ${band}` }],
+                        isError: true,
+                    };
+                }
+
+                try {
+                    this.wsjtxManager.setFrequency(instance_id, freq);
+                    const freqMHz = (freq / 1e6).toFixed(6);
+                    return {
+                        content: [{ type: "text" as const, text: `Tuned ${instance_id} to ${band} ${digital_mode || 'FT8'}: ${freqMHz} MHz` }],
+                    };
+                } catch (error) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: ${error}` }],
+                        isError: true,
+                    };
+                }
+            }
+        );
+    }
+
+    /**
+     * Convert frequency in Hz to band name
+     */
+    private frequencyToBand(freqHz: number): string {
+        const freqMHz = freqHz / 1e6;
+        if (freqMHz >= 1.8 && freqMHz < 2.0) return '160m';
+        if (freqMHz >= 3.5 && freqMHz < 4.0) return '80m';
+        if (freqMHz >= 5.3 && freqMHz < 5.5) return '60m';
+        if (freqMHz >= 7.0 && freqMHz < 7.3) return '40m';
+        if (freqMHz >= 10.1 && freqMHz < 10.15) return '30m';
+        if (freqMHz >= 14.0 && freqMHz < 14.35) return '20m';
+        if (freqMHz >= 18.068 && freqMHz < 18.168) return '17m';
+        if (freqMHz >= 21.0 && freqMHz < 21.45) return '15m';
+        if (freqMHz >= 24.89 && freqMHz < 24.99) return '12m';
+        if (freqMHz >= 28.0 && freqMHz < 29.7) return '10m';
+        if (freqMHz >= 50.0 && freqMHz < 54.0) return '6m';
+        if (freqMHz >= 144.0 && freqMHz < 148.0) return '2m';
+        return 'unknown';
+    }
+
+    /**
+     * Get default FT8/FT4 frequency for a band
+     */
+    private getBandFrequency(band: string, mode: string): number | null {
+        const ft8Frequencies: Record<string, number> = {
+            '160m': 1840000,
+            '80m': 3573000,
+            '60m': 5357000,
+            '40m': 7074000,
+            '30m': 10136000,
+            '20m': 14074000,
+            '17m': 18100000,
+            '15m': 21074000,
+            '12m': 24915000,
+            '10m': 28074000,
+            '6m': 50313000,
+            '2m': 144174000,
+        };
+
+        const ft4Frequencies: Record<string, number> = {
+            '160m': 1840000,
+            '80m': 3575000,
+            '60m': 5357000,
+            '40m': 7047500,
+            '30m': 10140000,
+            '20m': 14080000,
+            '17m': 18104000,
+            '15m': 21140000,
+            '12m': 24919000,
+            '10m': 28180000,
+            '6m': 50318000,
+            '2m': 144170000,
+        };
+
+        if (mode === 'FT4') {
+            return ft4Frequencies[band] || null;
+        }
+        return ft8Frequencies[band] || null;
     }
 
     private setupResources() {

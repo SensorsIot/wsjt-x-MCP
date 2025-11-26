@@ -1,19 +1,23 @@
 // WSJT-X UDP Message Types (QQT encoding)
+// Reference: https://sourceforge.net/p/wsjt/wsjtx/ci/master/tree/Network/NetworkMessage.hpp
 export enum WsjtxMessageType {
-    HEARTBEAT = 0,
-    STATUS = 1,
-    DECODE = 2,
-    CLEAR = 3,
-    REPLY = 4,
-    QSO_LOGGED = 5,
-    CLOSE = 6,
-    REPLAY = 7,
-    HALT_TX = 8,
-    FREE_TEXT = 9,
-    WSPR_DECODE = 10,
-    LOCATION = 11,
-    LOGGED_ADIF = 12,
-    HIGHLIGHT_CALLSIGN = 13,
+    HEARTBEAT = 0,          // Out/In - heartbeat with version info
+    STATUS = 1,             // Out - status update (frequency, mode, etc.)
+    DECODE = 2,             // Out - decoded message
+    CLEAR = 3,              // Out/In - clear decode windows
+    REPLY = 4,              // In - reply to a CQ/QRZ
+    QSO_LOGGED = 5,         // Out - QSO logged
+    CLOSE = 6,              // Out/In - application closing
+    REPLAY = 7,             // In - request decode replay
+    HALT_TX = 8,            // In - halt transmission
+    FREE_TEXT = 9,          // In - set free text message
+    WSPR_DECODE = 10,       // Out - WSPR decode
+    LOCATION = 11,          // In - set grid location
+    LOGGED_ADIF = 12,       // Out - ADIF log entry / In - Rig Control Command
+    RIG_CONTROL = 12,       // In - Rig control command (set frequency, mode, PTT)
+    HIGHLIGHT_CALLSIGN = 13, // In - highlight a callsign
+    SWITCH_CONFIGURATION = 14, // In - switch to named configuration
+    CONFIGURE = 15,         // In - configure mode, frequency, etc.
 }
 
 export interface WsjtxDecode {
