@@ -28,12 +28,12 @@ The system is TCP/UDP based. **No serial port emulation (COM ports) is used.**
 
 MCP is a daemon/service that:
 
-1. Controls up to **4 Flex slices** (A–D), each representing a **channel**.  
-2. Launches and manages **4 WSJT‑X instances**, one per channel.  
-3. Aggregates **all decodes** from all WSJT‑X instances.  
-4. Lets an AI choose which station to call, on which band, on which slice.  
-5. Commands WSJT‑X (via rig control and, later, WSJT‑X UDP) to **TX / RX**.  
-6. Logs QSOs in a **local ADIF logbook** and **forwards enriched QSOs** to an external logger.  
+1. Controls up to **4 Flex slices** (A–D), each representing a **channel**.
+2. Launches and manages **4 WSJT‑X instances**, one per channel.
+3. Aggregates **all decodes** from all WSJT‑X instances.
+4. Lets an AI choose which station to call and on which band, while MCP selects and manages the appropriate slice internally.
+5. Commands WSJT‑X (via rig control and, later, WSJT‑X UDP) to **TX / RX**.
+6. Logs QSOs in a **local ADIF logbook** and **forwards enriched QSOs** to an external logger.
 7. Ensures that **already-worked stations** (per band/mode) are not called again unless explicitly allowed.
 
 MCP is designed as the **control brain**; WSJT‑X, Flex, and Log4OM become **I/O devices** from the AI’s perspective.
@@ -61,7 +61,7 @@ MCP is designed as the **control brain**; WSJT‑X, Flex, and Log4OM become **I/
       │   • UDP Decode Aggregator                                                │
       │   • WorkedIndex / Duplicate Detector                                     │
       │   • ADIF Logbook Writer                                                  │
-      │   • REST / LLM Tool Interface                                            │
+      │   • MCP / REST interface for LLM tools                                   │
       └───────────────▲──────────────────────────────────────────────▲──────────┘
                       │                                              │
                       │ HRD TCP + UDP                                │ Flex API
@@ -327,35 +327,196 @@ Messages are parsed from the WSJT‑X standard binary UDP format.
 
 ## 7.2 Decode Representation
 
-For each decode, MCP produces an internal record:
+For each decode, MCP produces an internal record with enriched metadata. This internal representation includes channel/slice information for routing and all fields needed to construct the MCP-facing `DecodeRecord` (see Chapter 11).
 
-```jsonc
-DecodeRecord {
-  timestamp: string,     // ISO8601 UTC
-  channel_index: number, // 0–3
-  slice_id: string,      // "A".."D"
-  dial_hz: number,       // from channel state
-  audio_offset_hz: number,
-  rf_hz: number,         // dial_hz + audio_offset_hz
-  snr_db: number,
-  dt_sec: number,
-  call: string | null,
-  grid: string | null,
-  is_cq: boolean,
-  is_my_call: boolean,
-  raw_text: string
+```typescript
+InternalDecodeRecord {
+  // Internal routing fields (not exposed to MCP clients)
+  channel_index: number,         // 0–3
+  slice_id: string,              // "A".."D"
+
+  // Core decode data
+  timestamp: string,             // ISO8601 UTC
+  band: string,                  // e.g. "20m", "40m"
+  mode: string,                  // e.g. "FT8", "FT4"
+  dial_hz: number,               // WSJT-X dial frequency in Hz
+  audio_offset_hz: number,       // Audio offset (DF) in Hz
+  rf_hz: number,                 // RF frequency (dial_hz + audio_offset_hz)
+  snr_db: number,                // SNR in dB
+  dt_sec: number,                // Timing offset in seconds
+  call: string,                  // Decoded primary callsign (non-null after filtering)
+  grid: string | null,           // Maidenhead locator or null
+  is_cq: boolean,                // True if this is a CQ-type message
+  is_my_call: boolean,           // True if message is addressed to our callsign
+  raw_text: string,              // Raw WSJT-X decoded message text
+
+  // Enriched CQ targeting fields (computed by §7.3)
+  is_directed_cq_to_me: boolean, // True if station is allowed to answer
+  cq_target_token: string | null,// CQ target keyword ("DX", "NA", etc.) or null
+
+  // Optional WSJT-X flags
+  is_new?: boolean,              // WSJT-X "new" flag
+  low_confidence?: boolean,      // WSJT-X lowConfidence flag
+  off_air?: boolean              // WSJT-X offAir flag
 }
 ```
 
-## 7.3 Storage & Lifetime
+**Note:** The MCP-facing `DecodeRecord` (exposed via `wsjt-x://decodes` in Chapter 11) is derived from this by:
+- Dropping `channel_index` and `slice_id` (internal routing details)
+- Adding a unique `id` field for client-side referencing
+- Filtering out records where `call` is null
 
-- MCP maintains an **in-memory ring buffer per channel**, storing decodes from a **configurable time window** (e.g., last 15 minutes).  
+## 7.3 CQ Target Enrichment (Server-Side Logic)
+
+The MCP server enriches each decode with CQ targeting information to enable intelligent station selection by AI agents. This logic is implemented server-side and clients MUST NOT reimplement it.
+
+### 7.3.1 Station Profile
+
+Station configuration that MCP uses to evaluate CQ targets. Values come from MCP settings (callsign, grid, DXCC info, etc.).
+
+```typescript
+type StationProfile = {
+  my_call: string;          // e.g. "HB9BLA"
+  my_continent: string;     // "EU", "NA", "SA", "AF", "AS", "OC", "AN"
+  my_dxcc: string;          // e.g. "HB9"
+  my_prefixes: string[];    // all known prefixes that map to this station
+  // optional: CQ zone, ITU zone, custom regions, etc.
+};
+```
+
+### 7.3.2 CQ Target Token Extraction
+
+Parse a CQ message and extract the CQ target token, if any.
+
+**Examples:**
+- `"CQ HB9XYZ JN36"` → `null`
+- `"CQ DX HB9XYZ JN36"` → `"DX"`
+- `"CQ NA W1ABC FN31"` → `"NA"`
+- `"CQ EU DL1ABC JO62"` → `"EU"`
+- `"CQ JA JA1XYZ PM95"` → `"JA"`
+
+**Implementation:**
+```typescript
+function extractCqTargetToken(raw_text: string): string | null {
+  // Very simple parsing strategy (can be extended as needed):
+  // 1. Must start with "CQ " (case-insensitive, trimmed).
+  // 2. Split on whitespace.
+  // 3. Tokens[0] = "CQ"
+  // 4. Tokens[1]:
+  //    - if it looks like a region keyword (DX, NA, EU, SA, AS, AF, OC, JA, ...),
+  //      return that token uppercased.
+  //    - otherwise, treat it as part of the callsign and return null.
+  const text = raw_text.trim().toUpperCase();
+  if (!text.startsWith("CQ ")) return null;
+
+  const tokens = text.split(/\s+/);
+  if (tokens.length < 2) return null;
+
+  const t1 = tokens[1]; // token after "CQ"
+
+  const REGION_KEYWORDS = new Set([
+    "DX", "NA", "SA", "EU", "AS", "AF", "OC", "JA"
+    // can be extended with e.g. "ASIA", "EUROPE" if needed
+  ]);
+
+  if (REGION_KEYWORDS.has(t1)) {
+    return t1;
+  }
+
+  // Otherwise treat tokens[1] as a callsign -> no explicit CQ target token.
+  return null;
+}
+```
+
+### 7.3.3 CQ Targeting Rules
+
+Decide if this station is allowed to answer a given CQ message. This function encapsulates all rules that convert the raw CQ target token + station location into `is_directed_cq_to_me`.
+
+**Implementation:**
+```typescript
+function isDirectedCqToMe(
+  snapshotStation: StationProfile,
+  cq_target_token: string | null
+): boolean {
+  // No explicit target token => general CQ => always allowed.
+  if (cq_target_token === null) return true;
+
+  const continent = snapshotStation.my_continent.toUpperCase();
+
+  switch (cq_target_token) {
+    case "DX":
+      // "CQ DX" means "stations that are DX to me", i.e., not in the caller's
+      // own DXCC/region. The strict, symmetric version would require the
+      // caller's DXCC. For a first implementation, we can approximate DX by
+      // "not in the caller's continent" if that information is available.
+      //
+      // Since we don't have the caller's profile here, MCP may implement
+      // CQ DX logic as a simple station-level policy. For many operators it's
+      // acceptable to consider everyone "eligible" for CQ DX, or allow users
+      // to configure this policy.
+      //
+      // Minimal safe default: treat CQ DX as allowed for all stations.
+      return true;
+
+    case "NA":
+      return continent === "NA";
+    case "SA":
+      return continent === "SA";
+    case "EU":
+      return continent === "EU";
+    case "AS":
+      return continent === "AS";
+    case "AF":
+      return continent === "AF";
+    case "OC":
+      return continent === "OC";
+    case "JA":
+      // For JA you can either:
+      //  - require my_dxcc / prefix to be JA,
+      //  - or a mapping "JA" -> continent "AS" AND prefix starts with "JA", "JR", "7J", etc.
+      return snapshotStation.my_dxcc.toUpperCase().startsWith("JA");
+
+    default:
+      // Unknown or unsupported CQ target token:
+      // Conservative approach: do NOT answer.
+      return false;
+  }
+}
+```
+
+### 7.3.4 Integration into DecodeRecord Construction
+
+Given a raw WSJT-X decode and the station profile, MCP does:
+
+```typescript
+const cq_target_token = extractCqTargetToken(raw_text);
+const is_directed_cq_to_me = isDirectedCqToMe(stationProfile, cq_target_token);
+```
+
+and then fills:
+
+```typescript
+record.cq_target_token = cq_target_token;
+record.is_directed_cq_to_me = is_directed_cq_to_me;
+```
+
+**Important:** If the message is not a CQ at all (`is_cq = false`), MCP MUST set:
+```typescript
+cq_target_token = null;
+is_directed_cq_to_me = false;    // only CQ messages can be "directed to me"
+```
+
+The enriched `InternalDecodeRecord` objects are collected into a `DecodesSnapshot` object (assigning each record a unique `id` and removing internal routing fields), which is then exposed via the `wsjt-x://decodes` resource and embedded in `resources/updated` events (see Chapter 11).
+
+## 7.4 Storage & Lifetime
+
+- MCP maintains an **in-memory ring buffer per channel**, storing decodes from a **configurable time window** (e.g., last 15 minutes).
 - The actual implementation may use:
   - Time-based eviction (drop records older than `config.decode_history_minutes`).
 
 No persistent storage for decodes is required in v3.
 
-## 7.4 Duplicate Detection
+## 7.5 Duplicate Detection
 
 MCP must be able to answer: *“Have we already worked CALL on BAND and MODE?”*
 
@@ -521,155 +682,671 @@ src/
 
 ---
 
-# 11. LLM Tool / REST API
+# 11. MCP Protocol Interface
 
-The AI interacts with MCP via a **tool-like JSON API** (could be transported via REST or other RPC).
+The AI interacts with MCP via the **Model Context Protocol (MCP)** using stdio transport. This chapter defines the transport layer, canonical data types, resources, events, and tools that AI agents use to consume decoded FT8/FT4 messages and initiate QSOs.
 
-## 11.1 `rig_get_state()`
+## 11.1 Transport & Protocol Compliance
 
-Returns full MCP state summary.
+### 11.1.1 Basic Transport
 
-**Request:**
+- **Protocol:** Model Context Protocol (MCP) v2024-11-05
+- **Transport:** stdio (stdin/stdout) - MCP ONLY uses stdio
+- **Server Name:** `wsjt-x-mcp`
+- **Server Version:** `1.0.0` (semantic versioning)
+- **Format:** JSON-RPC 2.0
+- **SDK:** `@modelcontextprotocol/sdk` (official MCP SDK)
 
+**Important:** The MCP interface is ONLY available via stdio. Other interfaces (HTTP REST API, HRD TCP servers, WSJT-X UDP listeners) are backend services that MCP uses internally but are NOT part of the MCP transport.
+
+### 11.1.2 MCP Lifecycle
+
+The server implements the full MCP lifecycle using the official SDK:
+
+1. **initialize** - Client sends initialization request
+   - Server responds with `serverInfo`:
+     - `name`: "wsjt-x-mcp"
+     - `version`: "1.0.0"
+     - `protocolVersion`: "2024-11-05"
+   - Server declares `capabilities`:
+     - `tools`: true
+     - `resources`: true
+
+2. **initialized** - Client confirms initialization complete
+   - Server waits for this notification before sending `resources/updated` events
+
+3. **shutdown** - Clean shutdown request
+   - Server gracefully stops all WSJT-X instances
+   - Server closes FlexRadio connection
+
+4. **exit** - Final termination notification
+
+### 11.1.3 Tool & Resource Discovery
+
+- **listTools** - Returns all available tools with full JSON Schema definitions (SDK auto-generates from Zod schemas)
+- **listResources** - Returns all resources with URIs, types, and MIME types
+
+## 11.2 Canonical Types
+
+### 11.2.1 DecodeRecord Type
+
+One decoded FT8/FT4 message, enriched by MCP for AI use. This type is the canonical shape used in both:
+- The `wsjt-x://decodes` resource
+- The `resources/updated` event payload (snapshot)
+
+**TypeScript Definition:**
+```typescript
+type DecodeRecord = {
+  id: string;               // Opaque ID, unique within this snapshot
+
+  timestamp: string;        // ISO8601 UTC decode time
+
+  band: string;             // e.g. "20m", "40m"
+  mode: string;             // e.g. "FT8", "FT4"
+
+  dial_hz: number;          // WSJT-X dial frequency in Hz
+  audio_offset_hz: number;  // Audio offset (DF) in Hz
+  rf_hz: number;            // RF frequency in Hz (dial_hz + audio_offset_hz)
+
+  snr_db: number;           // SNR in dB
+  dt_sec: number;           // Timing offset in seconds
+
+  call: string;             // Decoded primary callsign in the message
+  grid: string | null;      // Maidenhead locator or null if unknown
+
+  is_cq: boolean;           // True if this is a CQ-type message
+  is_my_call: boolean;      // True if this message is addressed to our own callsign
+
+  /**
+   * True if THIS station (the configured operator) is allowed to answer this CQ
+   * according to the CQ pattern (CQ DX, CQ NA, CQ EU, CQ JA, etc.) and the
+   * operator's own location (DXCC, continent, etc.).
+   *
+   * The MCP server is responsible for evaluating this field based on station
+   * configuration. The client MUST treat this as authoritative and MUST NOT
+   * reimplement CQ-target logic itself.
+   */
+  is_directed_cq_to_me: boolean;
+
+  /**
+   * Raw CQ target token extracted from the message, if any.
+   *
+   * Examples:
+   *   "CQ DX HB9XYZ JN36"   -> cq_target_token = "DX"
+   *   "CQ NA W1ABC FN31"    -> cq_target_token = "NA"
+   *   "CQ EU DL1ABC JO62"   -> cq_target_token = "EU"
+   *   "CQ JA JA1XYZ PM95"   -> cq_target_token = "JA"
+   *
+   * Null if no explicit CQ-target token was present (plain CQ).
+   * This is informational only; clients do not need to interpret it.
+   */
+  cq_target_token: string | null;
+
+  raw_text: string;         // Raw WSJT-X decoded message text
+
+  // Optional flags derived from WSJT-X UDP fields.
+  is_new?: boolean;         // WSJT-X "new" flag
+  low_confidence?: boolean; // WSJT-X lowConfidence flag
+  off_air?: boolean;        // WSJT-X offAir flag
+};
+```
+
+### 11.2.2 DecodesSnapshot Type
+
+A full, self-contained snapshot of the current decode state. This snapshot is the canonical representation and MUST be used:
+- As the body of the `wsjt-x://decodes` resource
+- As the snapshot object embedded in `resources/updated` events for `uri = "wsjt-x://decodes"`
+
+At each update, the snapshot used for the resource and the event MUST be bitwise identical (modulo JSON serialization).
+
+**TypeScript Definition:**
+```typescript
+type DecodesSnapshot = {
+  snapshot_id: string;      // Unique ID for this snapshot (e.g. UUID)
+  generated_at: string;     // ISO8601 UTC time when this snapshot was built
+  decodes: DecodeRecord[];  // Full decode list MCP exposes to the client
+};
+```
+
+**Example:**
 ```json
-{ "action": "rig_get_state" }
-```
-
-**Response (example):**
-
-```jsonc
 {
-  "channels": [
-    {
-      "id": "A",
-      "index": 0,
-      "freq_hz": 14074000,
-      "band": "20m",
-      "mode": "FT8",
-      "is_tx": true,
-      "status": "decoding",
-      "last_decode_time": "2025-11-26T18:42:05Z"
-    },
-    ...
-  ],
-  "flex_connected": true
-}
-```
-
-## 11.2 `rig_tune_channel(index, freq_hz)`
-
-Moves a specific channel to a new frequency.
-
-**Request:**
-
-```json
-{
-  "action": "rig_tune_channel",
-  "channel_index": 1,
-  "freq_hz": 7074000
-}
-```
-
-**Behavior:**
-- MCP calls `FlexBackend.setSliceFrequency(1, freq_hz)`.  
-- HRD server for that channel reflects the new frequency.  
-- WSJT‑X sees frequency change via its HRD connection.
-
-## 11.3 `rig_set_tx_channel(index)`
-
-Sets which channel is TX slice.
-
-**Request:**
-
-```json
-{
-  "action": "rig_set_tx_channel",
-  "channel_index": 2
-}
-```
-
-MCP invokes `FlexBackend.setTxSlice(2)` and updates internal state.
-
-## 11.4 `rig_emergency_stop()`
-
-Immediately stops all transmissions.
-
-**Request:**
-
-```json
-{ "action": "rig_emergency_stop" }
-```
-
-Behavior:
-
-- Sends `set ptt off` to all HRD channels.  
-- Calls backend to disable any active TX slice if necessary.  
-
-## 11.5 `wsjtx_get_decodes(channel_index, since_ms)`
-
-Returns recent decodes for a channel.
-
-**Request:**
-
-```json
-{
-  "action": "wsjtx_get_decodes",
-  "channel_index": 0,
-  "since_ms": 30000
-}
-```
-
-**Response:**
-
-```jsonc
-{
+  "snapshot_id": "2025-11-29T10:30:00Z-001",
+  "generated_at": "2025-11-29T10:30:00Z",
   "decodes": [
     {
-      "timestamp": "2025-11-26T18:42:05Z",
-      "rf_hz": 14074750,
+      "id": "decode-001",
+      "timestamp": "2025-11-29T10:29:45Z",
+      "band": "20m",
+      "mode": "FT8",
       "dial_hz": 14074000,
-      "snr_db": -12,
-      "dt_sec": 0.4,
+      "audio_offset_hz": 1234,
+      "rf_hz": 14075234,
+      "snr_db": -8,
+      "dt_sec": 0.3,
       "call": "DL1ABC",
       "grid": "JO62",
       "is_cq": true,
-      "is_my_call": false
+      "is_my_call": false,
+      "is_directed_cq_to_me": true,
+      "cq_target_token": null,
+      "raw_text": "CQ DL1ABC JO62"
     }
   ]
 }
 ```
 
-## 11.6 `log_get_worked(call, band, mode)`
+## 11.3 MCP Resources
 
-Checks if a station is already in the logbook on a specific band/mode.
+### 11.3.1 Resource: `wsjt-x://decodes`
 
-**Request:**
+Read-only JSON resource that returns the current `DecodesSnapshot`. This is primarily used for recovery, debugging, and late joiners. Normal operation relies on the `resources/updated` event.
 
+**Resource Definition:**
+- **URI:** `wsjt-x://decodes`
+- **MIME Type:** `application/json`
+- **Content:** `DecodesSnapshot` (as defined in §11.1.2)
+
+**Example Response:**
 ```json
 {
-  "action": "log_get_worked",
-  "call": "DL1ABC",
-  "band": "20m",
-  "mode": "FT8"
+  "snapshot_id": "2025-11-29T10:30:00Z-001",
+  "generated_at": "2025-11-29T10:30:00Z",
+  "decodes": [
+    {
+      "id": "decode-001",
+      "timestamp": "2025-11-29T10:29:45Z",
+      "band": "20m",
+      "mode": "FT8",
+      "dial_hz": 14074000,
+      "audio_offset_hz": 1234,
+      "rf_hz": 14075234,
+      "snr_db": -8,
+      "dt_sec": 0.3,
+      "call": "DL1ABC",
+      "grid": "JO62",
+      "is_cq": true,
+      "is_my_call": false,
+      "is_directed_cq_to_me": true,
+      "cq_target_token": null,
+      "raw_text": "CQ DL1ABC JO62"
+    }
+  ]
 }
 ```
 
-**Response:**
+## 11.4 MCP Events
 
-```jsonc
+### 11.4.1 Event: `resources/updated` for `wsjt-x://decodes`
+
+Whenever MCP receives a new batch of decodes (e.g. at the end of an FT8/FT4 decoding cycle), it MUST:
+
+1. Build a new `DecodesSnapshot` in memory
+2. Store it as the current snapshot for `wsjt-x://decodes`
+3. Emit a JSON-RPC notification:
+   - **Method:** `resources/updated`
+   - **Params:**
+     - `uri`: `"wsjt-x://decodes"`
+     - `snapshot`: `<DecodesSnapshot>`
+
+The snapshot embedded in the event MUST be exactly the same object that is returned by reading `wsjt-x://decodes` (same `snapshot_id`, same `decodes` array).
+
+**Event Payload:**
+```json
 {
-  "worked": true,
-  "last_qso_time": "2025-11-20T19:05:00Z"
+  "jsonrpc": "2.0",
+  "method": "resources/updated",
+  "params": {
+    "uri": "wsjt-x://decodes",
+    "snapshot": {
+      "snapshot_id": "2025-11-29T10:30:00Z-001",
+      "generated_at": "2025-11-29T10:30:00Z",
+      "decodes": [
+        {
+          "id": "decode-001",
+          "timestamp": "2025-11-29T10:29:45Z",
+          "band": "20m",
+          "mode": "FT8",
+          "dial_hz": 14074000,
+          "audio_offset_hz": 1234,
+          "rf_hz": 14075234,
+          "snr_db": -8,
+          "dt_sec": 0.3,
+          "call": "DL1ABC",
+          "grid": "JO62",
+          "is_cq": true,
+          "is_my_call": false,
+          "is_directed_cq_to_me": true,
+          "cq_target_token": null,
+          "raw_text": "CQ DL1ABC JO62"
+        }
+      ]
+    }
+  }
 }
 ```
 
-## 11.7 `log_get_recent_qsos(limit)`
+**Implementation Notes:**
+- The MCP server MUST wait for the `initialized` notification before sending `resources/updated` events
+- Events are sent automatically whenever WSJT-X completes a decoding cycle (typically every 15 seconds for FT8, 7.5 seconds for FT4)
+- Clients subscribe to these events to maintain real-time awareness of decoded stations
 
-Returns recent QSOs from MCP logbook.
+## 11.5 MCP Tools
 
-## 11.8 Future: `ai_call_best_station()`
+AI agents SHOULD primarily use `call_cq`, `answer_decoded_station`, and `log_get_worked`, along with the `wsjt-x://decodes` resource. These tools provide a clean, high-level interface for autonomous FT8/FT4 operation. Slice and instance selection are handled automatically by MCP based on band and frequency.
 
-Not defined in strict detail here, but the FSD supports it: AI can use `wsjtx_get_decodes` + `log_get_worked` + `rig_tune_channel` + PTT control to implement autonomous calling logic.
+### 11.5.1 Tool: `call_cq`
+
+Start or continue calling CQ. The server is responsible for selecting the appropriate transmit path (slice / WSJT-X instance) and configuring it.
+
+**Parameters:**
+```typescript
+{
+  "band"?:   string;  // optional, e.g. "20m"
+  "freq_hz"?: number; // optional dial frequency in Hz
+  "mode"?:   string;  // optional, "FT8" or "FT4" (default: "FT8")
+}
+```
+
+**Output:**
+```typescript
+{
+  "status":  string;  // human-readable status
+  "band":    string;  // actual band used
+  "freq_hz": number;  // actual dial frequency used
+  "mode":    string;  // actual mode used
+}
+```
+
+**Example Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-001",
+  "method": "tools/call",
+  "params": {
+    "name": "call_cq",
+    "arguments": {
+      "band": "20m",
+      "mode": "FT8"
+    }
+  }
+}
+```
+
+**Example Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-001",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\"status\": \"Calling CQ on 20m FT8\", \"band\": \"20m\", \"freq_hz\": 14074000, \"mode\": \"FT8\"}"
+    }]
+  }
+}
+```
+
+### 11.5.2 Tool: `answer_decoded_station`
+
+Answer one of the currently decoded stations. The client passes only the `decode_id` from the latest `DecodesSnapshot`; MCP resolves all rig/slice details internally and uses WSJT-X Reply to initiate the QSO.
+
+**Parameters:**
+```typescript
+{
+  "decode_id":    string;  // DecodeRecord.id to answer
+  "force_mode"?:  string;  // optional override: "FT8" | "FT4"
+}
+```
+
+**Output:**
+```typescript
+{
+  "status":       string;  // e.g. "Reply sent, QSO in progress"
+  "band":         string;  // band used for the reply
+  "freq_hz":      number;  // dial frequency used
+  "mode":         string;  // mode used
+  "target_call":  string;  // callsign being answered
+}
+```
+
+**Example Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-002",
+  "method": "tools/call",
+  "params": {
+    "name": "answer_decoded_station",
+    "arguments": {
+      "decode_id": "decode-001"
+    }
+  }
+}
+```
+
+**Example Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-002",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\"status\": \"Reply sent, QSO in progress\", \"band\": \"20m\", \"freq_hz\": 14074000, \"mode\": \"FT8\", \"target_call\": \"DL1ABC\"}"
+    }]
+  }
+}
+```
+
+**Implementation Notes:**
+- The MCP server uses the WSJT-X Reply protocol (message type 4 with Shift modifier 0x02) to initiate the QSO
+- The server automatically selects the correct WSJT-X instance and slice based on the decode's band/frequency
+- Requires `HoldTxFreq=true` and `AutoSeq=true` in WSJT-X INI files (see §11.5.4)
+
+### 11.5.3 Tool: `log_get_worked`
+
+Check if a station has been worked on a specific band and mode. AI agents MUST use this tool before answering CQ calls to avoid duplicate contacts.
+
+**Parameters:**
+```typescript
+{
+  "call": string;  // Callsign to check
+  "band": string;  // Band (e.g., "20m", "40m")
+  "mode": string;  // Mode (e.g., "FT8", "FT4")
+}
+```
+
+**Output:**
+```typescript
+{
+  "worked": boolean;           // True if station has been worked
+  "call": string;              // Callsign checked
+  "band": string;              // Band checked
+  "mode": string;              // Mode checked
+  "last_qso_time"?: string;    // ISO8601 time of last QSO (if worked)
+}
+```
+
+**Example Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-003",
+  "method": "tools/call",
+  "params": {
+    "name": "log_get_worked",
+    "arguments": {
+      "call": "DL1ABC",
+      "band": "20m",
+      "mode": "FT8"
+    }
+  }
+}
+```
+
+**Example Response (not worked):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-003",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\"worked\": false, \"call\": \"DL1ABC\", \"band\": \"20m\", \"mode\": \"FT8\"}"
+    }]
+  }
+}
+```
+
+**Example Response (already worked):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-003",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\"worked\": true, \"call\": \"DL1ABC\", \"band\": \"20m\", \"mode\": \"FT8\", \"last_qso_time\": \"2025-11-26T18:42:05Z\"}"
+    }]
+  }
+}
+```
+
+### 11.5.4 WSJT-X Reply Protocol Requirements
+
+For automatic TX to start after answering a decoded station, the following MUST be set in the WSJT-X INI file:
+
+- `HoldTxFreq=true` in [Common] section - Prevents frequency changes and enables auto-TX after Reply
+- `AutoSeq=true` in [Common] section - Enables automatic FT8 sequencing (handles RR73, 73, etc.)
+
+The MCP automatically configures these settings when generating INI files for managed instances (see WsjtxConfig.ts:825). If TX does not start after a Reply message, verify these settings in the instance's INI file.
+
+**Reply Message Behavior:**
+When WSJT-X receives a Reply message (type 4) with the Shift modifier (0x02), it:
+1. Populates the DX Call and DX Grid fields
+2. Sets the audio frequency (DF) to the decode's frequency
+3. Arms the TX sequencer (Halt TX is unchecked)
+4. Enables transmit for the next TX period (if `HoldTxFreq=true`)
+
+This is the same mechanism used by GridTracker, N1MM Logger+, and VARA to control WSJT-X.
+
+## 11.6 Autonomous QSO Workflow & Examples
+
+This section demonstrates how AI agents should implement autonomous FT8/FT4 operation using the canonical MCP interface.
+
+### 11.6.1 Standard Workflow
+
+The canonical autonomous QSO workflow is:
+
+1. **Receive decodes** via `resources/updated` event (uri: `wsjt-x://decodes`)
+   - Event contains full `DecodesSnapshot` with all current decodes
+   - Clients cache this snapshot for processing
+
+2. **Filter candidates**:
+   - `d.is_cq === true` - Only CQ messages
+   - `d.is_directed_cq_to_me === true` - Only CQs we're allowed to answer
+   - **IMPORTANT**: AI agents MUST respect `is_directed_cq_to_me`. Answering when this is `false` violates amateur radio etiquette.
+
+3. **Check duplicates**:
+   - For each candidate, call `log_get_worked(d.call, d.band, d.mode)`
+   - Skip stations that have already been worked
+
+4. **Select best candidate**:
+   - Sort by SNR, new grids, priority rules, etc.
+   - Select the optimal station to call
+
+5. **Answer the station**:
+   - Call `answer_decoded_station({ decode_id: best.id })`
+   - MCP handles all slice/instance selection automatically
+
+6. **Optional: Call CQ when idle**:
+   - If no good candidates, call `call_cq({ band: "20m", mode: "FT8" })`
+
+**Critical Rule**: Clients MUST NOT:
+- Reimplement CQ targeting logic
+- Reference slice, channel, or instance IDs
+- Use low-level tools like `wsjtx_reply_to_station` or `execute_qso`
+
+### 11.6.2 Example: Basic Autonomous Hunt
+
+**Listening for decodes and answering the strongest new station:**
+
+```typescript
+// Step 1: Listen for resources/updated events
+onResourcesUpdated((event) => {
+  if (event.params.uri !== "wsjt-x://decodes") return;
+
+  const snapshot = event.params.snapshot as DecodesSnapshot;
+
+  // Step 2: Filter candidates
+  const candidates = snapshot.decodes.filter(d =>
+    d.is_cq && d.is_directed_cq_to_me
+  );
+
+  // Step 3: Check duplicates and collect new stations
+  const newStations = [];
+  for (const decode of candidates) {
+    const result = await call_tool("log_get_worked", {
+      call: decode.call,
+      band: decode.band,
+      mode: decode.mode
+    });
+
+    if (!result.worked) {
+      newStations.push(decode);
+    }
+  }
+
+  // Step 4: Select best candidate (strongest SNR)
+  newStations.sort((a, b) => b.snr_db - a.snr_db);
+
+  // Step 5: Answer the best station
+  if (newStations.length > 0) {
+    const best = newStations[0];
+    console.log(`Answering ${best.call} on ${best.band} (SNR: ${best.snr_db}dB)`);
+
+    await call_tool("answer_decoded_station", {
+      decode_id: best.id
+    });
+  }
+});
+```
+
+### 11.6.3 Example: Multi-Band Hunt with Priority
+
+**Working new grids across multiple bands with prioritization:**
+
+```typescript
+onResourcesUpdated(async (event) => {
+  if (event.params.uri !== "wsjt-x://decodes") return;
+
+  const snapshot = event.params.snapshot as DecodesSnapshot;
+
+  // Filter: CQs directed to us, SNR > -10dB
+  const candidates = snapshot.decodes.filter(d =>
+    d.is_cq &&
+    d.is_directed_cq_to_me &&
+    d.snr_db > -10
+  );
+
+  // Check which are new
+  const newStations = [];
+  for (const decode of candidates) {
+    const result = await call_tool("log_get_worked", {
+      call: decode.call,
+      band: decode.band,
+      mode: decode.mode
+    });
+
+    if (!result.worked) {
+      newStations.push({
+        ...decode,
+        priority: calculatePriority(decode)  // Custom priority logic
+      });
+    }
+  }
+
+  // Sort by priority, then SNR
+  newStations.sort((a, b) => {
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    return b.snr_db - a.snr_db;
+  });
+
+  // Answer the highest priority station
+  if (newStations.length > 0) {
+    const best = newStations[0];
+    await call_tool("answer_decoded_station", {
+      decode_id: best.id
+    });
+  } else {
+    // No good candidates - call CQ on preferred band
+    await call_tool("call_cq", {
+      band: "20m",
+      mode: "FT8"
+    });
+  }
+});
+
+function calculatePriority(decode: DecodeRecord): number {
+  let priority = 0;
+
+  // Prefer new grids
+  if (decode.grid && !isGridWorked(decode.grid)) {
+    priority += 100;
+  }
+
+  // Prefer higher bands (DX potential)
+  if (decode.band === "10m") priority += 50;
+  if (decode.band === "15m") priority += 40;
+  if (decode.band === "20m") priority += 30;
+
+  // Prefer strong signals
+  priority += decode.snr_db;
+
+  return priority;
+}
+```
+
+### 11.6.4 Example: Respecting CQ Targeting
+
+**Demonstrating proper use of `is_directed_cq_to_me`:**
+
+```typescript
+onResourcesUpdated(async (event) => {
+  if (event.params.uri !== "wsjt-x://decodes") return;
+
+  const snapshot = event.params.snapshot as DecodesSnapshot;
+
+  // CORRECT: Filter using is_directed_cq_to_me
+  const allowed = snapshot.decodes.filter(d =>
+    d.is_cq && d.is_directed_cq_to_me
+  );
+
+  // INCORRECT: Do NOT reimplement targeting logic
+  // ❌ BAD CODE (do not use):
+  // const allowed = snapshot.decodes.filter(d => {
+  //   if (!d.is_cq) return false;
+  //   if (d.cq_target_token === null) return true;
+  //   if (d.cq_target_token === "EU" && MY_CONTINENT === "EU") return true;
+  //   return false;
+  // });
+
+  // The server has already evaluated is_directed_cq_to_me correctly.
+  // Clients MUST trust this field and MUST NOT reimplement the logic.
+
+  // ... rest of workflow
+});
+```
+
+### 11.6.5 Error Handling
+
+**Common errors and how to handle them:**
+
+```typescript
+try {
+  await call_tool("answer_decoded_station", {
+    decode_id: "decode-001"
+  });
+} catch (error) {
+  if (error.message.includes("Decode not found")) {
+    // Decode expired from snapshot - normal, move to next candidate
+    console.log("Decode expired, trying next station");
+  } else if (error.message.includes("Instance busy")) {
+    // WSJT-X instance is in active QSO - wait for completion
+    console.log("Instance busy with QSO, will try later");
+  } else {
+    console.error("Unexpected error:", error);
+  }
+}
+```
+
+**Important Notes:**
+- Decode IDs are only valid within their snapshot
+- If a decode expires before you answer, try the next candidate
+- MCP handles all slice/instance conflicts automatically
+- Clients should gracefully handle errors and continue operation
 
 ---
 
